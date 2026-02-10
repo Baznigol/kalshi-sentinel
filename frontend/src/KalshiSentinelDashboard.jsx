@@ -442,6 +442,7 @@ export default function KalshiSentinelDashboard() {
   const [err, setErr] = useState(null);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(null);
+  const [pnlSnap, setPnlSnap] = useState(null);
 
   const statusOk = !!status && typeof status.exchange_active === "boolean";
 
@@ -450,6 +451,13 @@ export default function KalshiSentinelDashboard() {
       .then((r) => r.json())
       .then(setStatus)
       .catch((e) => setErr(String(e)));
+  }, []);
+
+  useEffect(() => {
+    const load = () => fetch(API + "/status/positions_mtm").then((r) => r.json()).then(setPnlSnap).catch(() => {});
+    load();
+    const iv = setInterval(load, 5000);
+    return () => clearInterval(iv);
   }, []);
 
   const loadMarkets = async ({ reset } = { reset: true }) => {
@@ -493,7 +501,7 @@ export default function KalshiSentinelDashboard() {
           { label: "Trading Active", value: status?.trading_active ? "YES" : "NO", color: status?.trading_active ? TEAL : AMBER_COLD },
           { label: "Exchange Active", value: status?.exchange_active ? "YES" : "NO", color: status?.exchange_active ? TEAL : RED_COLD },
           { label: "Signals", value: "—", color: AMBER_COLD },
-          { label: "PnL", value: "—", color: AMBER_COLD },
+          { label: "PnL (unreal)", value: pnlSnap?.totals ? `${(pnlSnap.totals.unreal_pnl_cents/100).toFixed(2)}` : "—", color: (pnlSnap?.totals?.unreal_pnl_cents ?? 0) >= 0 ? TEAL : RED_COLD },
         ].map((m) => (
           <div key={m.label} style={{ background: BG_PANEL, padding: "14px 8px" }}>
             <Metric label={m.label} value={m.value} color={m.color} />
