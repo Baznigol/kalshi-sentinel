@@ -4,19 +4,17 @@
 WARNING: This is an early execution loop. It is intentionally conservative:
 - Uses Kalshi orderbook to compute implied ask
 - Uses Fill-or-Kill orders
-- Hard caps max spend per trade and max trades per day
-- Stops at a configured cutoff time
+- Hard caps max spend per trade and max net spend per day
+- Runs continuously until you stop it (Ctrl+C)
 
 It trades only when AUTO_TRADING_ENABLED=true in config/.env
 
 Config (config/.env):
 - AUTO_TRADING_ENABLED=true
-- TRADER_MAX_TRADES=5
 - TRADER_MAX_COST_CENTS_PER_TRADE=200
-- TRADER_DAILY_MAX_COST_CENTS=500
+- TRADER_DAILY_MAX_COST_CENTS=1000   # interpreted as max NET spend per local day
 - TRADER_INTERVAL_SECONDS=120
 - TRADER_HOURS_AHEAD=8
-- TRADER_CUTOFF_LOCAL=2026-02-10T17:00:00-05:00
 
 This script calls the local backend (http://127.0.0.1:8099), so backend must be running.
 """
@@ -85,11 +83,13 @@ def main():
     # Heartbeat logging
     heartbeat_every = int(os.getenv("TRADER_HEARTBEAT_EVERY_LOOPS", "5"))
 
-    max_trades = int(os.getenv("TRADER_MAX_TRADES", "5"))
-    target_trades = int(os.getenv("TRADER_TARGET_TRADES", str(max_trades)))
+    # Optional stop conditions (default disabled)
+    max_trades = int(os.getenv("TRADER_MAX_TRADES", "0"))
+    target_trades = int(os.getenv("TRADER_TARGET_TRADES", "0"))
     target_spend_cents = int(os.getenv("TRADER_TARGET_SPEND_CENTS", "0"))
 
     max_cost_trade = int(os.getenv("TRADER_MAX_COST_CENTS_PER_TRADE", "200"))
+    # Daily budget cap (NET spend): computed from balance delta since local midnight.
     daily_max_cost = int(os.getenv("TRADER_DAILY_MAX_COST_CENTS", "500"))
     force_complete = os.getenv("TRADER_FORCE_COMPLETE", "false").lower() == "true"
 
@@ -105,18 +105,22 @@ def main():
         daily_max_cost = max(daily_max_cost, target_trades * max_cost_trade)
 
     cutoff_s = os.getenv("TRADER_CUTOFF_LOCAL", "")
-    cutoff = parse_iso(cutoff_s) if cutoff_s else None
+    cutoff = parse_iso(cutoff_s) if cutoff_s else None  # deprecated (no hard stop)
 
-    spent = 0
+    # Daily accounting (resets at local midnight)
+    day_key = _now().date()
+    day_start_avail_cents = None  # set after first successful balance fetch
+    net_spent_today_cents = 0
+
     fills = 0
 
     _log("Kalshi Sentinel AUTOTRADER v0", log_path=log_path)
     _log(f"Base={base}", log_path=log_path)
     _log(f"Allow prefixes={allow_prefixes}", log_path=log_path)
-    _log(f"Max trades={max_trades} Target trades={target_trades} Target spend={target_spend_cents}c ForceComplete={force_complete}", log_path=log_path)
-    _log(f"Max cost/trade={max_cost_trade}c Daily max cost={daily_max_cost}c Interval={interval}s HoursAhead={hours_ahead}", log_path=log_path)
+    _log(f"Max trades={max_trades or '∞'} Target trades={target_trades or '—'} Target spend={target_spend_cents or '—'}c ForceComplete={force_complete}", log_path=log_path)
+    _log(f"Max cost/trade={max_cost_trade}c Daily net spend cap={daily_max_cost}c Interval={interval}s HoursAhead={hours_ahead}", log_path=log_path)
     _log(f"Baseline gates: max_entry={base_max_entry_price_cents}c min_top_qty={base_min_top_qty}", log_path=log_path)
-    _log(f"Cutoff={cutoff_s or '(none)'}", log_path=log_path)
+    _log(f"Cutoff={(cutoff_s or '(none)')} (deprecated; no hard stop)", log_path=log_path)
 
     loops = 0
     stats = {
@@ -136,52 +140,37 @@ def main():
     while True:
         loops += 1
         now = _now()
-        if cutoff and now >= cutoff:
-            print("Cutoff reached; stopping.")
-            break
-        if target_spend_cents > 0 and spent >= target_spend_cents:
+
+        # Reset daily accounting at local midnight
+        if now.date() != day_key:
+            day_key = now.date()
+            day_start_avail_cents = None
+            net_spent_today_cents = 0
+            _log(f"new day {day_key.isoformat()}: resetting daily accounting", log_path=log_path)
+
+        # Optional stop conditions (disabled when 0)
+        if target_spend_cents > 0 and net_spent_today_cents >= target_spend_cents:
             _log("Target spend reached; stopping.", log_path=log_path)
             break
-        if fills >= target_trades:
+        if target_trades > 0 and fills >= target_trades:
             _log("Target fills reached; stopping.", log_path=log_path)
             break
-        if fills >= max_trades:
+        if max_trades > 0 and fills >= max_trades:
             _log("Max trades reached; stopping.", log_path=log_path)
             break
-        if spent >= daily_max_cost:
-            _log("Daily spend cap reached; stopping.", log_path=log_path)
-            break
 
-        # Deadline-aware relaxation
+        # Gates (optionally can be relaxed in the future; cutoff-based pacing is disabled when running continuously)
         max_entry_price_cents = base_max_entry_price_cents
         min_top_qty = base_min_top_qty
         tif = "fill_or_kill"
 
-        secs_left = None
         mins_left = None
         if cutoff:
-            secs_left = max(0, int((cutoff - now).total_seconds()))
-            mins_left = secs_left / 60.0
-            fills_left = max(0, target_trades - fills)
-            loops_left = max(1, int(secs_left // max(1, interval)))
-
-            # If we're behind pace (need >=1 fill per remaining loop), relax aggressively.
-            behind = fills_left >= loops_left
-
-            if mins_left <= 5 or behind:
-                max_entry_price_cents = max(max_entry_price_cents, 70)
-                min_top_qty = min(min_top_qty, 10)
-                tif = "immediate_or_cancel"
-            elif mins_left <= 20:
-                max_entry_price_cents = max(max_entry_price_cents, 60)
-                min_top_qty = min(min_top_qty, 20)
-                tif = "immediate_or_cancel"
-            elif mins_left <= 45:
-                max_entry_price_cents = max(max_entry_price_cents, 50)
-                min_top_qty = min(min_top_qty, 30)
-            elif mins_left <= 90:
-                max_entry_price_cents = max(max_entry_price_cents, 40)
-                min_top_qty = min(min_top_qty, 40)
+            # informational only (no hard stop)
+            try:
+                mins_left = max(0.0, (cutoff - now).total_seconds() / 60.0)
+            except Exception:
+                mins_left = None
 
         # 0) position-aware throttling (avoid stacking correlated BTC/ETH exposure)
         try:
@@ -202,6 +191,18 @@ def main():
             avail_cents = int(float(bal.get("balance", 0)) * 100)
         except Exception:
             avail_cents = 0
+
+        # Initialize day-start balance and compute net spend today.
+        if avail_cents > 0:
+            if day_start_avail_cents is None:
+                day_start_avail_cents = avail_cents
+            net_spent_today_cents = max(0, int(day_start_avail_cents - avail_cents))
+
+        # Daily net spend cap check (runs continuously until stopped)
+        if daily_max_cost > 0 and net_spent_today_cents >= daily_max_cost:
+            _log(f"Daily net spend cap reached ({net_spent_today_cents}c >= {daily_max_cost}c); sleeping", log_path=log_path)
+            time.sleep(max(30, interval))
+            continue
 
         # Spot price update (for BTC momentum signal)
         spot_px = None
@@ -250,7 +251,7 @@ def main():
             stats["paper_empty"] += 1
             if loops % heartbeat_every == 0:
                 _log(
-                    f"heartbeat loops={loops} fills={fills} spent={spent}c budget_left={(target_spend_cents-spent) if target_spend_cents>0 else (daily_max_cost-spent)}c "
+                    f"heartbeat loops={loops} fills={fills} net_spent_today={net_spent_today_cents}c budget_left={(daily_max_cost-net_spent_today_cents) if daily_max_cost>0 else '—'}c "
                     f"mins_left={mins_left if mins_left is not None else '—'} paper_calls={stats['paper_calls']} paper_empty={stats['paper_empty']} btc_exp={btc_exposure}c eth_exp={eth_exposure}c",
                     log_path=log_path,
                 )
@@ -360,7 +361,7 @@ def main():
         if not chosen:
             if loops % heartbeat_every == 0:
                 _log(
-                    f"heartbeat loops={loops} fills={fills} spent={spent}c mins_left={mins_left if mins_left is not None else '—'} "
+                    f"heartbeat loops={loops} fills={fills} net_spent_today={net_spent_today_cents}c mins_left={mins_left if mins_left is not None else '—'} "
                     f"paper_props={len(props)} checked={stats['candidates_checked']} ob_calls={stats['ob_calls']} skips_price={stats['skips_price']} skips_qty={stats['skips_qty']}",
                     log_path=log_path,
                 )
@@ -384,9 +385,9 @@ def main():
         count = None
 
         # 3) place FoK order (limit)
-        buy_max_cost = min(max_cost_trade, daily_max_cost - spent)
+        buy_max_cost = min(max_cost_trade, max(0, daily_max_cost - net_spent_today_cents))
         if target_spend_cents > 0:
-            buy_max_cost = min(buy_max_cost, max(0, target_spend_cents - spent))
+            buy_max_cost = min(buy_max_cost, max(0, target_spend_cents - net_spent_today_cents))
         if avail_cents > 0:
             buy_max_cost = min(buy_max_cost, max(0, avail_cents - 25))  # keep small buffer
         if buy_max_cost <= 0:
@@ -452,12 +453,12 @@ def main():
             _log(f"NO FILL: {ticker} {side.upper()} @ {price}c tif={payload.get('time_in_force')}", log_path=log_path)
         else:
             trade_cost = filled_cost if filled_cost is not None else payload["buy_max_cost"]
-            spent += trade_cost
             fills += 1
             stats["fills"] = fills
             _log(
-                f"FILL #{fills}: {ticker} BUY {side.upper()} @ {price}c qty={filled_qty} cost={trade_cost}c spent={spent}c "
-                f"budget_left={(target_spend_cents-spent) if target_spend_cents>0 else (daily_max_cost-spent)}c tif={payload.get('time_in_force')}",
+                f"FILL #{fills}: {ticker} BUY {side.upper()} @ {price}c qty={filled_qty} cost={trade_cost}c "
+                f"net_spent_today={net_spent_today_cents}c budget_left={(daily_max_cost-net_spent_today_cents) if daily_max_cost>0 else '—'}c "
+                f"tif={payload.get('time_in_force')}",
                 log_path=log_path,
             )
 
