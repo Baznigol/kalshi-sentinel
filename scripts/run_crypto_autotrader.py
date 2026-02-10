@@ -24,7 +24,9 @@ This script calls the local backend (http://127.0.0.1:8099), so backend must be 
 import os
 import time
 import json
+import math
 import datetime as dt
+from collections import deque
 from dotenv import load_dotenv
 import requests
 
@@ -64,6 +66,15 @@ def main():
 
     # Optional allowlist for what the autotrader is allowed to touch.
     allow_prefixes = [p.strip() for p in os.getenv("TRADER_TICKER_ALLOW_PREFIXES", "KXBTC,KXBTC15M,KXBTCD,KXETH").split(",") if p.strip()]
+
+    # External price feed (Coinbase spot)
+    price_feed_url = os.getenv("TRADER_PRICE_FEED_URL", "https://api.coinbase.com/v2/prices/BTC-USD/spot")
+    momentum_lookback = int(os.getenv("TRADER_MOMENTUM_LOOKBACK_SECONDS", "180"))
+    momentum_threshold_bps = float(os.getenv("TRADER_MOMENTUM_THRESHOLD_BPS", "8"))  # 8 bps = 0.08%
+    min_minutes_to_close = float(os.getenv("TRADER_MIN_MINUTES_TO_CLOSE", "2"))
+
+    # Maintain rolling BTC spot samples
+    spot = deque(maxlen=5000)
 
     port = int(os.getenv("PORT", "8099"))
     base = f"http://127.0.0.1:{port}"
@@ -192,6 +203,29 @@ def main():
         except Exception:
             avail_cents = 0
 
+        # Spot price update (for BTC momentum signal)
+        spot_px = None
+        spot_ret_bps = None
+        try:
+            pr = requests.get(price_feed_url, timeout=10).json()
+            amt = (pr.get("data") or {}).get("amount")
+            if amt is not None:
+                spot_px = float(amt)
+                spot.append((time.time(), spot_px))
+
+                # compute lookback return
+                t_now = spot[-1][0]
+                t_cut = t_now - momentum_lookback
+                p0 = None
+                for (t, p) in reversed(spot):
+                    if t <= t_cut:
+                        p0 = p
+                        break
+                if p0:
+                    spot_ret_bps = ((spot_px / p0) - 1.0) * 10000.0
+        except Exception as e:
+            _log(f"spot feed error: {e}", log_path=log_path)
+
         # 1) get paper proposals (crypto discovery + scoring)
         try:
             stats["paper_calls"] += 1
@@ -225,14 +259,17 @@ def main():
             continue
 
         chosen = None
-        chosen_ob = None
         chosen_side = None
         chosen_price = None
+        chosen_title = None
+        chosen_close_time = None
 
         # Try multiple proposals until one passes gates
         for p in props[:10]:
             stats["candidates_checked"] += 1
             ticker = p.get("ticker")
+            title = (p.get("title") or "")
+            close_time = p.get("close_time")
             if not ticker:
                 continue
             if allow_prefixes and not any(str(ticker).startswith(px) for px in allow_prefixes):
@@ -267,13 +304,45 @@ def main():
             implied_yes_ask = 100 - best_no_bid
             implied_no_ask = 100 - best_yes_bid
 
-            side = "yes" if implied_yes_ask <= implied_no_ask else "no"
+            # Decide direction using BTC momentum for "up in next 15 mins" markets.
+            # - If momentum is positive enough -> buy YES
+            # - If momentum is negative enough -> buy NO (i.e., bet NOT up)
+            # Otherwise skip.
+            want_side = None
+            if "UP" in title.upper() and "15" in title:
+                if spot_ret_bps is not None:
+                    if spot_ret_bps >= momentum_threshold_bps:
+                        want_side = "yes"
+                    elif spot_ret_bps <= -momentum_threshold_bps:
+                        want_side = "no"
+                else:
+                    # No signal -> skip
+                    want_side = None
+            else:
+                # Unknown market semantics; skip for safety
+                want_side = None
+
+            if not want_side:
+                continue
+
+            side = want_side
             price = implied_yes_ask if side == "yes" else implied_no_ask
 
             if price > max_entry_price_cents:
                 stats["skips_price"] += 1
                 _log(f"skip {ticker}: entry too expensive {price}c > {max_entry_price_cents}c", log_path=log_path)
                 continue
+
+            # Time-to-close gate (avoid trading the last ~minutes)
+            try:
+                if close_time:
+                    # close_time comes like 2026-02-10T19:45:00Z
+                    ct = dt.datetime.fromisoformat(str(close_time).replace('Z', '+00:00')).astimezone()
+                    mins_to_close = (ct - now).total_seconds() / 60.0
+                    if mins_to_close < min_minutes_to_close:
+                        continue
+            except Exception:
+                pass
 
             top_qty = best_no_qty if side == "yes" else best_yes_qty
             if top_qty < min_top_qty:
@@ -282,9 +351,10 @@ def main():
                 continue
 
             chosen = ticker
-            chosen_ob = ob
             chosen_side = side
             chosen_price = max(1, min(99, int(price)))
+            chosen_title = title
+            chosen_close_time = close_time
             break
 
         if not chosen:
@@ -301,6 +371,12 @@ def main():
         ticker = chosen
         side = chosen_side
         price = chosen_price
+
+        _log(
+            f"select ticker={ticker} side={side.upper()} px={price}c title={chosen_title!r} close={chosen_close_time} "
+            f"spot={spot_px if spot_px is not None else '—'} ret_bps={spot_ret_bps if spot_ret_bps is not None else '—'}",
+            log_path=log_path,
+        )
 
         # Set count consistent with buy_max_cost so exchange doesn't reject on worst-case notional.
         # For a BUY at price cents, max fillable contracts <= floor(max_cost_cents / price).
