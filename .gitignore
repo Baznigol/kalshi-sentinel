@@ -1,0 +1,16 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# local env/secrets
+config/.env
+*.pem
+
+# data
+/data/
+*.db
+
+# frontend
+frontend/node_modules/
+frontend/dist/
