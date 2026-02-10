@@ -23,6 +23,7 @@ This script calls the local backend (http://127.0.0.1:8099), so backend must be 
 
 import os
 import time
+import json
 import datetime as dt
 from dotenv import load_dotenv
 import requests
@@ -40,6 +41,22 @@ def parse_iso(s: str):
         return None
 
 
+def _now():
+    return dt.datetime.now().astimezone()
+
+
+def _log(line: str, *, log_path: str | None = None):
+    ts = _now().strftime('%Y-%m-%d %H:%M:%S%z')
+    msg = f"[{ts}] {line}"
+    print(msg, flush=True)
+    if log_path:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+
+
 def main():
     if os.getenv("AUTO_TRADING_ENABLED", "false").lower() != "true":
         print("AUTO_TRADING_ENABLED is false; refusing to trade.")
@@ -50,6 +67,12 @@ def main():
 
     port = int(os.getenv("PORT", "8099"))
     base = f"http://127.0.0.1:{port}"
+
+    log_path = os.getenv("TRADER_LOG_PATH", os.path.join(REPO_DIR, "data", "autotrader.log"))
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+
+    # Heartbeat logging
+    heartbeat_every = int(os.getenv("TRADER_HEARTBEAT_EVERY_LOOPS", "5"))
 
     max_trades = int(os.getenv("TRADER_MAX_TRADES", "5"))
     target_trades = int(os.getenv("TRADER_TARGET_TRADES", str(max_trades)))
@@ -76,32 +99,46 @@ def main():
     spent = 0
     fills = 0
 
-    print("Kalshi Sentinel AUTOTRADER v0")
-    print("Base:", base)
-    print("Max trades:", max_trades)
-    print("Target trades:", target_trades)
-    print("Force complete:", force_complete)
-    print("Max cost/trade (cents):", max_cost_trade)
-    print("Daily max cost (cents):", daily_max_cost)
-    print("Interval (sec):", interval)
-    print("Cutoff:", cutoff_s or "(none)")
+    _log("Kalshi Sentinel AUTOTRADER v0", log_path=log_path)
+    _log(f"Base={base}", log_path=log_path)
+    _log(f"Allow prefixes={allow_prefixes}", log_path=log_path)
+    _log(f"Max trades={max_trades} Target trades={target_trades} Target spend={target_spend_cents}c ForceComplete={force_complete}", log_path=log_path)
+    _log(f"Max cost/trade={max_cost_trade}c Daily max cost={daily_max_cost}c Interval={interval}s HoursAhead={hours_ahead}", log_path=log_path)
+    _log(f"Baseline gates: max_entry={base_max_entry_price_cents}c min_top_qty={base_min_top_qty}", log_path=log_path)
+    _log(f"Cutoff={cutoff_s or '(none)'}", log_path=log_path)
+
+    loops = 0
+    stats = {
+        "paper_calls": 0,
+        "paper_empty": 0,
+        "ob_calls": 0,
+        "skips_price": 0,
+        "skips_qty": 0,
+        "skips_allow": 0,
+        "skips_exposure": 0,
+        "candidates_checked": 0,
+        "orders_posted": 0,
+        "order_errors": 0,
+        "fills": 0,
+    }
 
     while True:
-        now = dt.datetime.now().astimezone()
+        loops += 1
+        now = _now()
         if cutoff and now >= cutoff:
             print("Cutoff reached; stopping.")
             break
         if target_spend_cents > 0 and spent >= target_spend_cents:
-            print("Target spend reached; stopping.")
+            _log("Target spend reached; stopping.", log_path=log_path)
             break
         if fills >= target_trades:
-            print("Target fills reached; stopping.")
+            _log("Target fills reached; stopping.", log_path=log_path)
             break
         if fills >= max_trades:
-            print("Max trades reached; stopping.")
+            _log("Max trades reached; stopping.", log_path=log_path)
             break
         if spent >= daily_max_cost:
-            print("Daily spend cap reached; stopping.")
+            _log("Daily spend cap reached; stopping.", log_path=log_path)
             break
 
         # Deadline-aware relaxation
@@ -109,6 +146,8 @@ def main():
         min_top_qty = base_min_top_qty
         tif = "fill_or_kill"
 
+        secs_left = None
+        mins_left = None
         if cutoff:
             secs_left = max(0, int((cutoff - now).total_seconds()))
             mins_left = secs_left / 60.0
@@ -155,6 +194,7 @@ def main():
 
         # 1) get paper proposals (crypto discovery + scoring)
         try:
+            stats["paper_calls"] += 1
             r = requests.post(
                 base + "/api/paper/run_today",
                 json={
@@ -168,12 +208,19 @@ def main():
             j = r.json()
             props = j.get("proposed", [])
         except Exception as e:
-            print("paper error:", e)
+            _log(f"paper error: {e}", log_path=log_path)
             time.sleep(interval)
             continue
 
         if not props:
-            print("no proposals; sleeping")
+            stats["paper_empty"] += 1
+            if loops % heartbeat_every == 0:
+                _log(
+                    f"heartbeat loops={loops} fills={fills} spent={spent}c budget_left={(target_spend_cents-spent) if target_spend_cents>0 else (daily_max_cost-spent)}c "
+                    f"mins_left={mins_left if mins_left is not None else '—'} paper_calls={stats['paper_calls']} paper_empty={stats['paper_empty']} btc_exp={btc_exposure}c eth_exp={eth_exposure}c",
+                    log_path=log_path,
+                )
+            _log("no proposals; sleeping", log_path=log_path)
             time.sleep(interval)
             continue
 
@@ -184,23 +231,28 @@ def main():
 
         # Try multiple proposals until one passes gates
         for p in props[:10]:
+            stats["candidates_checked"] += 1
             ticker = p.get("ticker")
             if not ticker:
                 continue
             if allow_prefixes and not any(str(ticker).startswith(px) for px in allow_prefixes):
+                stats["skips_allow"] += 1
                 continue
 
             # exposure gate
             if str(ticker).startswith("KXETH") and eth_exposure >= max_eth:
+                stats["skips_exposure"] += 1
                 continue
             if (str(ticker).startswith("KXBTC") or str(ticker).startswith("KXBTCD")) and btc_exposure >= max_btc:
+                stats["skips_exposure"] += 1
                 continue
 
             # fetch orderbook depth 5
             try:
+                stats["ob_calls"] += 1
                 ob = requests.get(base + f"/api/kalshi/markets/{ticker}/orderbook", params={"depth": 5}, timeout=30).json()
             except Exception as e:
-                print("orderbook error:", ticker, e)
+                _log(f"orderbook error: {ticker} {e}", log_path=log_path)
                 continue
 
             book = (ob.get("orderbook") or {})
@@ -219,12 +271,14 @@ def main():
             price = implied_yes_ask if side == "yes" else implied_no_ask
 
             if price > max_entry_price_cents:
-                print(f"skip {ticker}: entry too expensive {price}c > {max_entry_price_cents}c")
+                stats["skips_price"] += 1
+                _log(f"skip {ticker}: entry too expensive {price}c > {max_entry_price_cents}c", log_path=log_path)
                 continue
 
             top_qty = best_no_qty if side == "yes" else best_yes_qty
             if top_qty < min_top_qty:
-                print(f"skip {ticker}: top-of-book qty too low {top_qty} < {min_top_qty}")
+                stats["skips_qty"] += 1
+                _log(f"skip {ticker}: top-of-book qty too low {top_qty} < {min_top_qty}", log_path=log_path)
                 continue
 
             chosen = ticker
@@ -234,7 +288,13 @@ def main():
             break
 
         if not chosen:
-            print("no candidates passed gates; sleeping")
+            if loops % heartbeat_every == 0:
+                _log(
+                    f"heartbeat loops={loops} fills={fills} spent={spent}c mins_left={mins_left if mins_left is not None else '—'} "
+                    f"paper_props={len(props)} checked={stats['candidates_checked']} ob_calls={stats['ob_calls']} skips_price={stats['skips_price']} skips_qty={stats['skips_qty']}",
+                    log_path=log_path,
+                )
+            _log("no candidates passed gates; sleeping", log_path=log_path)
             time.sleep(interval)
             continue
 
@@ -274,15 +334,18 @@ def main():
             payload["no_price"] = price
 
         try:
+            stats["orders_posted"] += 1
             resp = requests.post(base + "/api/kalshi/orders", json=payload, timeout=60)
             try:
                 data = resp.json()
             except Exception:
-                print("order post non-json:", resp.status_code, (resp.text or "")[:300])
+                stats["order_errors"] += 1
+                _log(f"order post non-json: {resp.status_code} {(resp.text or '')[:300]}", log_path=log_path)
                 time.sleep(interval)
                 continue
         except Exception as e:
-            print("order post error:", e)
+            stats["order_errors"] += 1
+            _log(f"order post error: {e}", log_path=log_path)
             time.sleep(interval)
             continue
 
@@ -310,14 +373,23 @@ def main():
             filled_qty = 0
 
         if filled_qty <= 0:
-            print(f"NO FILL: {ticker} {side.upper()} @ {price}c ({payload.get('time_in_force')})")
+            _log(f"NO FILL: {ticker} {side.upper()} @ {price}c tif={payload.get('time_in_force')}", log_path=log_path)
         else:
             trade_cost = filled_cost if filled_cost is not None else payload["buy_max_cost"]
             spent += trade_cost
             fills += 1
-            print(f"FILL #{fills}: {ticker} BUY {side.upper()} @ {price}c qty={filled_qty} cost={trade_cost}c (spent={spent}c) tif={payload.get('time_in_force')}")
+            stats["fills"] = fills
+            _log(
+                f"FILL #{fills}: {ticker} BUY {side.upper()} @ {price}c qty={filled_qty} cost={trade_cost}c spent={spent}c "
+                f"budget_left={(target_spend_cents-spent) if target_spend_cents>0 else (daily_max_cost-spent)}c tif={payload.get('time_in_force')}",
+                log_path=log_path,
+            )
 
-        print("response:", str(data)[:400])
+        # brief structured response for debugging
+        try:
+            _log("response: " + json.dumps(data)[:400], log_path=log_path)
+        except Exception:
+            _log("response: " + str(data)[:400], log_path=log_path)
 
         time.sleep(interval)
 
