@@ -141,6 +141,7 @@ def main():
     exits_enabled = os.getenv("TRADER_EXITS_ENABLED", "false").lower() == "true"
     take_profit_cents = int(os.getenv("TRADER_TAKE_PROFIT_UNREAL_CENTS", "0"))     # per-position unrealized pnl threshold
     stop_loss_cents = int(os.getenv("TRADER_STOP_LOSS_UNREAL_CENTS", "0"))         # per-position unrealized pnl threshold (negative)
+    exit_max_slip = int(os.getenv("TRADER_EXIT_MAX_SLIPPAGE_CENTS", "0"))          # sell at (best_bid - slip) to increase fill probability
 
     # Defaults (picked for your $10/day cap): take profit at +$1.00, stop at -$1.50 per position.
     if exits_enabled:
@@ -350,18 +351,32 @@ def main():
                     if not (hit_tp or hit_sl):
                         continue
 
-                    # Sell YES at best bid (conservative)
+                    # Sell at best bid (or a bit below if exit_max_slip is set)
                     sell_qty = pos_qty
+
+                    side = (r.get("side") or "yes").lower()
+                    if side not in ("yes", "no"):
+                        side = "yes"
+
+                    best_bid = int(r.get("best_exit_bid") or 0)
+                    if best_bid <= 0:
+                        continue
+                    sell_px = max(1, best_bid - max(0, exit_max_slip))
+
                     payload = {
                         "ticker": tkr,
-                        "side": "yes",
+                        "side": side,
                         "action": "sell",
                         "type": "limit",
                         "count": sell_qty,
                         "time_in_force": "immediate_or_cancel",
-                        "yes_price": best_yes_bid,
                     }
-                    _log(f"EXIT signal: {tkr} SELL YES qty={sell_qty} @ {best_yes_bid}c unreal={unreal}c", log_path=log_path)
+                    if side == "yes":
+                        payload["yes_price"] = sell_px
+                    else:
+                        payload["no_price"] = sell_px
+
+                    _log(f"EXIT signal: {tkr} SELL {side.upper()} qty={sell_qty} @ {sell_px}c (best={best_bid} slip={exit_max_slip}) unreal={unreal}c", log_path=log_path)
                     resp = requests.post(base + "/api/kalshi/orders", json=payload, timeout=60)
                     try:
                         data = resp.json()
@@ -388,8 +403,8 @@ def main():
                             filled_cost = 0
 
                     if filled_qty > 0:
-                        _record_trade(conn, ticker=tkr, side="yes", action="sell", price_cents=best_yes_bid, qty=filled_qty, cost_cents=filled_cost, order_id=order_id, raw=data)
-                        _send_telegram(f"Kalshi Sentinel EXIT: SOLD {tkr} YES qty={filled_qty} @ {best_yes_bid}c")
+                        _record_trade(conn, ticker=tkr, side=side, action="sell", price_cents=sell_px, qty=filled_qty, cost_cents=filled_cost, order_id=order_id, raw=data)
+                        _send_telegram(f"Kalshi Sentinel EXIT: SOLD {tkr} {side.upper()} qty={filled_qty} @ {sell_px}c")
             except Exception as e:
                 _log(f"exit loop error: {e}", log_path=log_path)
 

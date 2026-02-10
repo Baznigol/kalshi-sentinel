@@ -11,6 +11,7 @@ from db import init_db, db_health, get_db
 from audit import log as audit_log
 from strategy import choose_universe
 from status import positions_mtm
+from report import ledger_summary
 import json
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -144,6 +145,17 @@ def status_positions_mtm():
     except Exception as e:
         audit_log("ERROR", "status", "positions_mtm_failed", {"error": str(e)})
         return jsonify({"error": "positions_mtm_failed", "details": str(e)[:500]}), 500
+
+
+@app.route("/api/report/ledger")
+def report_ledger():
+    try:
+        days = int(request.args.get("days", "7"))
+        limit = int(request.args.get("limit", "200"))
+        return jsonify(ledger_summary(days=days, limit=limit))
+    except Exception as e:
+        audit_log("ERROR", "report", "ledger_failed", {"error": str(e)})
+        return jsonify({"error": "ledger_failed", "details": str(e)[:500]}), 500
 
 
 @app.route("/api/kalshi/orders", methods=["POST"])

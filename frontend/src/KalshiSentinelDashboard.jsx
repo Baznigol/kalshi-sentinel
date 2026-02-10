@@ -340,6 +340,85 @@ function PaperTab() {
   )
 }
 
+function PerformanceTab() {
+  const [snap, setSnap] = useState(null)
+  const [err, setErr] = useState(null)
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        setErr(null)
+        const j = await fetch(API + '/report/ledger?days=7&limit=200').then(r => r.json())
+        setSnap(j)
+      } catch (e) {
+        setErr(String(e))
+      }
+    }
+    load()
+    const iv = setInterval(load, 5000)
+    return () => clearInterval(iv)
+  }, [])
+
+  const daily = snap?.daily || []
+  const totals = snap?.totals
+  const recent = snap?.recent || []
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 14 }}>
+      <Panel title="PERFORMANCE (LOCAL LEDGER)">
+        {err && <pre style={{ color: RED_COLD, whiteSpace: 'pre-wrap' }}>{err}</pre>}
+        {snap?.error && <pre style={{ color: RED_COLD, whiteSpace: 'pre-wrap' }}>{JSON.stringify(snap, null, 2)}</pre>}
+
+        {totals && (
+          <div style={{ display: 'flex', gap: 18, fontSize: 12, color: SLATE, marginBottom: 10 }}>
+            <span>7D BUY ${(totals.buy_cents/100).toFixed(2)}</span>
+            <span>7D SELL ${(totals.sell_cents/100).toFixed(2)}</span>
+            <span>7D REALIZED ${(totals.realized_pnl_cents/100).toFixed(2)}</span>
+          </div>
+        )}
+
+        <Panel title={`DAILY (LAST ${snap?.days || 7}D)`}>
+          <ColHeaders columns={[{l:'DAY',w:'110px'},{l:'BUY',w:'90px',a:'right'},{l:'SELL',w:'90px',a:'right'},{l:'REALIZED',w:'100px',a:'right'},{l:'TRADES',w:'70px',a:'right'}]} />
+          <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+            {daily.map((d) => (
+              <div key={d.day} className="row-hover" style={{ display:'grid', gridTemplateColumns:'110px 90px 90px 100px 70px', gap:8, padding:'8px 10px', borderBottom:`1px solid ${GRID_LINE}`, fontSize:12 }}>
+                <span style={{ color: ICE }}>{d.day}</span>
+                <span style={{ color: FROST, textAlign:'right' }}>{(d.buy_cents/100).toFixed(2)}</span>
+                <span style={{ color: FROST, textAlign:'right' }}>{(d.sell_cents/100).toFixed(2)}</span>
+                <span style={{ color: d.realized_pnl_cents >= 0 ? TEAL : RED_COLD, textAlign:'right' }}>{(d.realized_pnl_cents/100).toFixed(2)}</span>
+                <span style={{ color: FROST, textAlign:'right' }}>{d.trades}</span>
+              </div>
+            ))}
+            {daily.length === 0 && <div style={{ padding: 14, color: SLATE }}>No ledger data yet.</div>}
+          </div>
+        </Panel>
+
+        <Panel title={`RECENT TRADES (${recent.length})`}>
+          <ColHeaders columns={[{l:'TS',w:'160px'},{l:'TICKER',w:'220px'},{l:'SIDE',w:'55px'},{l:'ACT',w:'55px'},{l:'PX',w:'55px',a:'right'},{l:'QTY',w:'55px',a:'right'},{l:'CENTS',w:'70px',a:'right'}]} />
+          <div style={{ maxHeight: '45vh', overflowY: 'auto' }}>
+            {recent.map((t, idx) => (
+              <div key={(t.ts || '') + ':' + idx} className="row-hover" style={{ display:'grid', gridTemplateColumns:'160px 220px 55px 55px 55px 55px 70px', gap:8, padding:'8px 10px', borderBottom:`1px solid ${GRID_LINE}`, fontSize:12 }}>
+                <span style={{ color: SLATE, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{(t.ts || '').replace('T',' ').slice(0,19)}</span>
+                <span style={{ color: ICE, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{t.ticker}</span>
+                <span style={{ color: t.side === 'yes' ? TEAL : RED_COLD }}>{String(t.side || '').toUpperCase()}</span>
+                <span style={{ color: FROST }}>{String(t.action || '').toUpperCase()}</span>
+                <span style={{ color: FROST, textAlign:'right' }}>{t.price_cents}</span>
+                <span style={{ color: FROST, textAlign:'right' }}>{t.qty}</span>
+                <span style={{ color: AMBER_COLD, textAlign:'right' }}>{(t.cost_cents/100).toFixed(2)}</span>
+              </div>
+            ))}
+            {recent.length === 0 && <div style={{ padding: 14, color: SLATE }}>No trades recorded yet.</div>}
+          </div>
+        </Panel>
+
+        <div style={{ marginTop: 8, color: SLATE, fontSize: 11, lineHeight: 1.5 }}>
+          This panel reads the local SQLite ledger written by the autotrader (data/trades.sqlite). Realized PnL is approximated as sells - buys per day.
+        </div>
+      </Panel>
+    </div>
+  )
+}
+
 function TradesTab() {
   const [orders, setOrders] = useState([])
   const [fills, setFills] = useState([])
@@ -511,7 +590,7 @@ export default function KalshiSentinelDashboard() {
 
       {/* Tabs */}
       <div style={{ display: "flex", borderBottom: `1px solid ${BORDER}`, background: BG_PANEL }}>
-        {["markets", "signals", "portfolio", "log", "paper", "trades", "audit"].map((t) => (
+        {["markets", "signals", "portfolio", "performance", "log", "paper", "trades", "audit"].map((t) => (
           <button key={t} className={`tab-btn ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
             {t.toUpperCase()}
           </button>
@@ -652,7 +731,11 @@ export default function KalshiSentinelDashboard() {
           <PortfolioTab />
         )}
 
-        {tab !== "markets" && tab !== "paper" && tab !== "audit" && tab !== "trades" && tab !== "portfolio" && (
+        {tab === "performance" && (
+          <PerformanceTab />
+        )}
+
+        {tab !== "markets" && tab !== "paper" && tab !== "audit" && tab !== "trades" && tab !== "portfolio" && tab !== "performance" && (
           <Panel title="NOT IMPLEMENTED YET">
             <div style={{ color: SLATE, fontSize: 12, lineHeight: 1.7 }}>
               This tab is a placeholder. Next we will implement:
