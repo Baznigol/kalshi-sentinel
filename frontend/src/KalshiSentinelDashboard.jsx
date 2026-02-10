@@ -235,24 +235,25 @@ function PortfolioTab() {
             <span>UNREAL ${(totals.unreal_pnl_cents/100).toFixed(2)}</span>
           </div>
         )}
-        <ColHeaders columns={[{l:'TICKER',w:'240px'},{l:'QTY',w:'60px',a:'right'},{l:'AVG',w:'70px',a:'right'},{l:'COST',w:'80px',a:'right'},{l:'BID',w:'60px',a:'right'},{l:'ASK',w:'60px',a:'right'},{l:'LIQ',w:'80px',a:'right'},{l:'UNREAL',w:'80px',a:'right'}]} />
+        <ColHeaders columns={[{l:'TICKER',w:'220px'},{l:'SIDE',w:'55px'},{l:'QTY',w:'60px',a:'right'},{l:'AVG',w:'70px',a:'right'},{l:'COST',w:'80px',a:'right'},{l:'EXIT BID',w:'70px',a:'right'},{l:'EXIT ASK',w:'70px',a:'right'},{l:'LIQ',w:'80px',a:'right'},{l:'UNREAL',w:'80px',a:'right'}]} />
         <div style={{ maxHeight: '70vh', overflowY: 'auto' }}>
           {rows.map((r) => (
-            <div key={r.ticker} className="row-hover" style={{ display:'grid', gridTemplateColumns:'240px 60px 70px 80px 60px 60px 80px 80px', gap:8, padding:'8px 10px', borderBottom:`1px solid ${GRID_LINE}`, fontSize:12 }}>
+            <div key={r.ticker + ':' + (r.side || '')} className="row-hover" style={{ display:'grid', gridTemplateColumns:'220px 55px 60px 70px 80px 70px 70px 80px 80px', gap:8, padding:'8px 10px', borderBottom:`1px solid ${GRID_LINE}`, fontSize:12 }}>
               <span style={{ color: ICE, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.ticker}</span>
-              <span style={{ color: FROST, textAlign:'right' }}>{r.position}</span>
+              <span style={{ color: r.side === 'yes' ? TEAL : RED_COLD }}>{String(r.side || '').toUpperCase()}</span>
+              <span style={{ color: FROST, textAlign:'right' }}>{r.qty}</span>
               <span style={{ color: FROST, textAlign:'right' }}>{r.avg_entry_cents}</span>
               <span style={{ color: FROST, textAlign:'right' }}>{(r.cost_basis_cents/100).toFixed(2)}</span>
-              <span style={{ color: TEAL, textAlign:'right' }}>{r.best_yes_bid}</span>
-              <span style={{ color: AMBER_COLD, textAlign:'right' }}>{r.implied_yes_ask}</span>
+              <span style={{ color: TEAL, textAlign:'right' }}>{r.best_exit_bid}</span>
+              <span style={{ color: AMBER_COLD, textAlign:'right' }}>{r.implied_exit_ask}</span>
               <span style={{ color: FROST, textAlign:'right' }}>{(r.liq_value_cents/100).toFixed(2)}</span>
               <span style={{ color: r.unreal_pnl_cents >= 0 ? TEAL : RED_COLD, textAlign:'right' }}>{(r.unreal_pnl_cents/100).toFixed(2)}</span>
             </div>
           ))}
-          {rows.length === 0 && <div style={{ padding: 18, color: SLATE }}>No positions.</div>}
+          {rows.length === 0 && <div style={{ padding: 18, color: SLATE }}>No open positions.</div>}
         </div>
         <div style={{ marginTop: 8, color: SLATE, fontSize: 11, lineHeight: 1.5 }}>
-          MTM is approximate: uses best YES bid as liquidation value and assumes positions are YES-only.
+          MTM is approximate: liquidation uses best bid on your position side (YES→best YES bid, NO→best NO bid). Ignores slippage.
         </div>
       </Panel>
     </div>

@@ -49,23 +49,33 @@ def positions_mtm(kc: KalshiClient, *, limit: int = 50) -> Dict[str, Any]:
         except Exception:
             bids = {"best_yes_bid": 0, "best_no_bid": 0, "implied_yes_ask": 0, "implied_no_ask": 0}
 
-        # We assume these positions are YES-only for now (your bot currently only buys YES).
-        # If you later trade NO or sell, we should extend this with side-aware tracking from fills.
-        best_exit_cents = bids["best_yes_bid"]
-        liq_value = position * best_exit_cents
+        # Side-aware MTM approximation:
+        # - If position > 0 treat as YES contracts; liquidate at best YES bid
+        # - If position < 0 treat as NO contracts; liquidate at best NO bid
+        side = "yes" if position > 0 else "no"
+        qty = abs(position)
+        best_exit_cents = bids["best_yes_bid"] if side == "yes" else bids["best_no_bid"]
+        implied_ask_cents = bids["implied_yes_ask"] if side == "yes" else bids["implied_no_ask"]
+
+        liq_value = qty * best_exit_cents
         unreal_pnl = liq_value - total_traded
 
-        avg_entry = (total_traded / position) if position else 0.0
+        avg_entry = (total_traded / qty) if qty else 0.0
 
         rows.append(
             {
                 "ticker": ticker,
-                "position": position,
+                "side": side,
+                "qty": qty,
                 "avg_entry_cents": round(avg_entry, 2),
                 "cost_basis_cents": total_traded,
                 "fees_paid_cents": fees_paid,
                 "best_yes_bid": bids["best_yes_bid"],
+                "best_no_bid": bids["best_no_bid"],
                 "implied_yes_ask": bids["implied_yes_ask"],
+                "implied_no_ask": bids["implied_no_ask"],
+                "best_exit_bid": best_exit_cents,
+                "implied_exit_ask": implied_ask_cents,
                 "liq_value_cents": liq_value,
                 "unreal_pnl_cents": unreal_pnl,
                 "updated_ms": int(time.time() * 1000),

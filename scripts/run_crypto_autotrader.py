@@ -141,6 +141,13 @@ def main():
     exits_enabled = os.getenv("TRADER_EXITS_ENABLED", "false").lower() == "true"
     take_profit_cents = int(os.getenv("TRADER_TAKE_PROFIT_UNREAL_CENTS", "0"))     # per-position unrealized pnl threshold
     stop_loss_cents = int(os.getenv("TRADER_STOP_LOSS_UNREAL_CENTS", "0"))         # per-position unrealized pnl threshold (negative)
+
+    # Defaults (picked for your $10/day cap): take profit at +$1.00, stop at -$1.50 per position.
+    if exits_enabled:
+        if take_profit_cents <= 0:
+            take_profit_cents = 100
+        if stop_loss_cents == 0:
+            stop_loss_cents = 150
     daily_loss_limit_cents = int(os.getenv("TRADER_DAILY_REALIZED_LOSS_LIMIT_CENTS", "0"))  # stops trading if realized pnl <= -limit
 
     # Local ledger
