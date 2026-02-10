@@ -23,6 +23,7 @@ import os
 import time
 import json
 import math
+import sqlite3
 import datetime as dt
 from collections import deque
 from dotenv import load_dotenv
@@ -57,6 +58,71 @@ def _log(line: str, *, log_path: str | None = None):
             pass
 
 
+def _send_telegram(text: str):
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _db(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS live_trades (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          day TEXT NOT NULL,
+          ticker TEXT NOT NULL,
+          side TEXT NOT NULL,          -- yes|no
+          action TEXT NOT NULL,        -- buy|sell
+          price_cents INTEGER NOT NULL,
+          qty INTEGER NOT NULL,
+          cost_cents INTEGER NOT NULL,
+          order_id TEXT,
+          raw_json TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_live_trades_day ON live_trades(day)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_live_trades_ticker ON live_trades(ticker)")
+    conn.commit()
+    return conn
+
+
+def _record_trade(conn, *, ticker: str, side: str, action: str, price_cents: int, qty: int, cost_cents: int, order_id: str | None, raw: dict):
+    ts = _now().isoformat()
+    day = str(_now().date())
+    conn.execute(
+        "INSERT INTO live_trades(ts, day, ticker, side, action, price_cents, qty, cost_cents, order_id, raw_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (ts, day, ticker, side, action, int(price_cents), int(qty), int(cost_cents), order_id, json.dumps(raw)[:5000]),
+    )
+    conn.commit()
+
+
+def _today_pnl(conn) -> int:
+    """Realized PnL in cents for today from our local ledger.
+
+    Approximation: realized = sells - buys (same day). Good enough as a guardrail.
+    """
+    day = str(_now().date())
+    cur = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN action='sell' THEN cost_cents ELSE 0 END),0) - COALESCE(SUM(CASE WHEN action='buy' THEN cost_cents ELSE 0 END),0) FROM live_trades WHERE day=?",
+        (day,),
+    )
+    v = cur.fetchone()[0]
+    return int(v or 0)
+
+
 def main():
     if os.getenv("AUTO_TRADING_ENABLED", "false").lower() != "true":
         print("AUTO_TRADING_ENABLED is false; refusing to trade.")
@@ -70,6 +136,16 @@ def main():
     momentum_lookback = int(os.getenv("TRADER_MOMENTUM_LOOKBACK_SECONDS", "180"))
     momentum_threshold_bps = float(os.getenv("TRADER_MOMENTUM_THRESHOLD_BPS", "8"))  # 8 bps = 0.08%
     min_minutes_to_close = float(os.getenv("TRADER_MIN_MINUTES_TO_CLOSE", "2"))
+
+    # Exits / risk guards
+    exits_enabled = os.getenv("TRADER_EXITS_ENABLED", "false").lower() == "true"
+    take_profit_cents = int(os.getenv("TRADER_TAKE_PROFIT_UNREAL_CENTS", "0"))     # per-position unrealized pnl threshold
+    stop_loss_cents = int(os.getenv("TRADER_STOP_LOSS_UNREAL_CENTS", "0"))         # per-position unrealized pnl threshold (negative)
+    daily_loss_limit_cents = int(os.getenv("TRADER_DAILY_REALIZED_LOSS_LIMIT_CENTS", "0"))  # stops trading if realized pnl <= -limit
+
+    # Local ledger
+    ledger_path = os.getenv("TRADER_LEDGER_PATH", os.path.join(REPO_DIR, "data", "trades.sqlite"))
+    conn = _db(ledger_path)
 
     # Maintain rolling BTC spot samples
     spot = deque(maxlen=5000)
@@ -115,6 +191,7 @@ def main():
     fills = 0
 
     _log("Kalshi Sentinel AUTOTRADER v0", log_path=log_path)
+    _send_telegram("Kalshi Sentinel autotrader started")
     _log(f"Base={base}", log_path=log_path)
     _log(f"Allow prefixes={allow_prefixes}", log_path=log_path)
     _log(f"Max trades={max_trades or '∞'} Target trades={target_trades or '—'} Target spend={target_spend_cents or '—'}c ForceComplete={force_complete}", log_path=log_path)
@@ -147,6 +224,16 @@ def main():
             day_start_avail_cents = None
             net_spent_today_cents = 0
             _log(f"new day {day_key.isoformat()}: resetting daily accounting", log_path=log_path)
+            _send_telegram(f"Kalshi Sentinel: new day {day_key.isoformat()} (daily limits reset)")
+
+        # Daily realized loss guard (requires sells to matter)
+        if daily_loss_limit_cents > 0:
+            realized = _today_pnl(conn)
+            if realized <= -abs(daily_loss_limit_cents):
+                _log(f"Daily realized loss limit hit: realized={realized}c <= -{abs(daily_loss_limit_cents)}c; sleeping", log_path=log_path)
+                _send_telegram(f"Kalshi Sentinel: daily realized loss limit hit ({realized}c). Pausing trading.")
+                time.sleep(max(60, interval))
+                continue
 
         # Optional stop conditions (disabled when 0)
         if target_spend_cents > 0 and net_spent_today_cents >= target_spend_cents:
@@ -226,6 +313,73 @@ def main():
                     spot_ret_bps = ((spot_px / p0) - 1.0) * 10000.0
         except Exception as e:
             _log(f"spot feed error: {e}", log_path=log_path)
+
+        # Optional exit logic (sell winners/losers)
+        if exits_enabled and (take_profit_cents > 0 or stop_loss_cents != 0):
+            try:
+                mtm = requests.get(base + "/api/status/positions_mtm", timeout=30).json()
+                rows = mtm.get("rows", []) or []
+                for r in rows[:50]:
+                    tkr = r.get("ticker")
+                    if not tkr:
+                        continue
+                    if allow_prefixes and not any(str(tkr).startswith(px) for px in allow_prefixes):
+                        continue
+                    pos_qty = int(r.get("position") or 0)
+                    if pos_qty <= 0:
+                        continue
+                    unreal = int(r.get("unreal_pnl_cents") or 0)
+                    best_yes_bid = int(r.get("best_yes_bid") or 0)
+                    if best_yes_bid <= 0:
+                        continue
+
+                    hit_tp = (take_profit_cents > 0 and unreal >= take_profit_cents)
+                    hit_sl = (stop_loss_cents != 0 and unreal <= -abs(stop_loss_cents))
+                    if not (hit_tp or hit_sl):
+                        continue
+
+                    # Sell YES at best bid (conservative)
+                    sell_qty = pos_qty
+                    payload = {
+                        "ticker": tkr,
+                        "side": "yes",
+                        "action": "sell",
+                        "type": "limit",
+                        "count": sell_qty,
+                        "time_in_force": "immediate_or_cancel",
+                        "yes_price": best_yes_bid,
+                    }
+                    _log(f"EXIT signal: {tkr} SELL YES qty={sell_qty} @ {best_yes_bid}c unreal={unreal}c", log_path=log_path)
+                    resp = requests.post(base + "/api/kalshi/orders", json=payload, timeout=60)
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        _log(f"exit order non-json: {resp.status_code} {(resp.text or '')[:300]}", log_path=log_path)
+                        continue
+
+                    # record if filled
+                    filled_qty = 0
+                    filled_cost = 0
+                    order_id = None
+                    if isinstance(data, dict) and isinstance(data.get("order"), dict):
+                        o = data["order"]
+                        order_id = o.get("order_id")
+                        try:
+                            filled_qty = int(o.get("fill_count", 0) or 0)
+                            # for sells, treat proceeds as cost_cents for ledger purposes
+                            taker = int(o.get("taker_fill_cost", 0) or 0)
+                            maker = int(o.get("maker_fill_cost", 0) or 0)
+                            fees = int(o.get("taker_fees", 0) or 0) + int(o.get("maker_fees", 0) or 0)
+                            filled_cost = taker + maker - fees
+                        except Exception:
+                            filled_qty = 0
+                            filled_cost = 0
+
+                    if filled_qty > 0:
+                        _record_trade(conn, ticker=tkr, side="yes", action="sell", price_cents=best_yes_bid, qty=filled_qty, cost_cents=filled_cost, order_id=order_id, raw=data)
+                        _send_telegram(f"Kalshi Sentinel EXIT: SOLD {tkr} YES qty={filled_qty} @ {best_yes_bid}c")
+            except Exception as e:
+                _log(f"exit loop error: {e}", log_path=log_path)
 
         # 1) get paper proposals (crypto discovery + scoring)
         try:
@@ -461,6 +615,8 @@ def main():
                 f"tif={payload.get('time_in_force')}",
                 log_path=log_path,
             )
+            _record_trade(conn, ticker=ticker, side=side, action="buy", price_cents=price, qty=filled_qty, cost_cents=trade_cost, order_id=(data.get('order') or {}).get('order_id') if isinstance(data, dict) else None, raw=data)
+            _send_telegram(f"Kalshi Sentinel FILL: {ticker} BUY {side.upper()} qty={filled_qty} @ {price}c cost={trade_cost}c")
 
         # brief structured response for debugging
         try:
