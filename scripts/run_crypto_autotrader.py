@@ -171,6 +171,11 @@ def main():
     target_trades = int(os.getenv("TRADER_TARGET_TRADES", "0"))
     target_spend_cents = int(os.getenv("TRADER_TARGET_SPEND_CENTS", "0"))
 
+    # Paper-runner proposal batch size (separate from stop conditions).
+    paper_max_trades = int(os.getenv("TRADER_PAPER_MAX_TRADES", "5"))
+    if paper_max_trades <= 0:
+        paper_max_trades = 5
+
     max_cost_trade = int(os.getenv("TRADER_MAX_COST_CENTS_PER_TRADE", "200"))
     # Daily budget cap (NET spend): computed from balance delta since local midnight.
     daily_max_cost = int(os.getenv("TRADER_DAILY_MAX_COST_CENTS", "500"))
@@ -396,7 +401,7 @@ def main():
                 json={
                     "hours_ahead": hours_ahead,
                     "budget_dollars": 10,
-                    "max_trades": max_trades,
+                    "max_trades": paper_max_trades,
                     "ticker_prefixes": allow_prefixes,
                 },
                 timeout=30,
