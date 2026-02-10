@@ -263,7 +263,13 @@ def paper_run_today():
     # Discover crypto series tickers and pull open markets for them.
     series = _discover_crypto_series(kc)
     markets = []
-    for s in series[:15]:
+
+    # If caller is forcing a narrow prefix like KXBTC15M, we must scan more series; it may not appear in the first 15.
+    series_cap = 15
+    if ticker_prefixes and any(p.startswith("KXBTC15M") for p in ticker_prefixes):
+        series_cap = 80
+
+    for s in series[:series_cap]:
         st = s.get("ticker")
         if not st:
             continue
@@ -275,6 +281,25 @@ def paper_run_today():
     # Optional ticker prefix filter (useful for forcing BTC15M-only, etc.)
     if ticker_prefixes:
         markets = [m for m in markets if any(str(m.get('ticker','')).startswith(p) for p in ticker_prefixes)]
+
+    # Fallback: if series discovery didn't yield anything (common with narrow prefixes), scan open markets pages.
+    if ticker_prefixes and not markets:
+        cursor = None
+        for _ in range(8):
+            params = {"limit": 200, "status": "open"}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                data = kc.get("/markets", params=params)
+            except Exception as e:
+                audit_log("WARN", "discover", "markets_scan_failed", {"error": str(e)})
+                break
+            page = data.get("markets", []) or []
+            page = [m for m in page if any(str(m.get('ticker','')).startswith(p) for p in ticker_prefixes)]
+            markets.extend(page)
+            cursor = data.get("cursor")
+            if not cursor or len(markets) >= 300:
+                break
 
     universe = choose_universe(markets, hours_ahead=hours_ahead)
     universe = [u for u in universe if 'crypto' in (u.tags or [])]
