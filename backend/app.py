@@ -253,6 +253,10 @@ def paper_run_today():
     hours_ahead = int(body.get("hours_ahead", 24))
     budget = float(body.get("budget_dollars", 10))
     max_trades = int(body.get("max_trades", 3))
+    ticker_prefixes = body.get("ticker_prefixes") or []
+    if isinstance(ticker_prefixes, str):
+        ticker_prefixes = [ticker_prefixes]
+    ticker_prefixes = [p for p in ticker_prefixes if isinstance(p, str) and p.strip()]
 
     kc = KalshiClient.from_env()
 
@@ -267,6 +271,10 @@ def paper_run_today():
             markets.extend(_fetch_markets_for_series(kc, st))
         except Exception as e:
             audit_log("WARN", "discover", "series_fetch_failed", {"series_ticker": st, "error": str(e)})
+
+    # Optional ticker prefix filter (useful for forcing BTC15M-only, etc.)
+    if ticker_prefixes:
+        markets = [m for m in markets if any(str(m.get('ticker','')).startswith(p) for p in ticker_prefixes)]
 
     universe = choose_universe(markets, hours_ahead=hours_ahead)
     universe = [u for u in universe if 'crypto' in (u.tags or [])]

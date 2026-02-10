@@ -157,7 +157,12 @@ def main():
         try:
             r = requests.post(
                 base + "/api/paper/run_today",
-                json={"hours_ahead": hours_ahead, "budget_dollars": 10, "max_trades": max_trades},
+                json={
+                    "hours_ahead": hours_ahead,
+                    "budget_dollars": 10,
+                    "max_trades": max_trades,
+                    "ticker_prefixes": allow_prefixes,
+                },
                 timeout=30,
             )
             j = r.json()
