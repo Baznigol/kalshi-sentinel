@@ -53,6 +53,7 @@ def main():
 
     max_trades = int(os.getenv("TRADER_MAX_TRADES", "5"))
     target_trades = int(os.getenv("TRADER_TARGET_TRADES", str(max_trades)))
+    target_spend_cents = int(os.getenv("TRADER_TARGET_SPEND_CENTS", "0"))
 
     max_cost_trade = int(os.getenv("TRADER_MAX_COST_CENTS_PER_TRADE", "200"))
     daily_max_cost = int(os.getenv("TRADER_DAILY_MAX_COST_CENTS", "500"))
@@ -89,6 +90,9 @@ def main():
         now = dt.datetime.now().astimezone()
         if cutoff and now >= cutoff:
             print("Cutoff reached; stopping.")
+            break
+        if target_spend_cents > 0 and spent >= target_spend_cents:
+            print("Target spend reached; stopping.")
             break
         if fills >= target_trades:
             print("Target fills reached; stopping.")
@@ -141,6 +145,13 @@ def main():
 
         max_btc = int(os.getenv("TRADER_MAX_BTC_EXPOSURE_CENTS", "2000"))
         max_eth = int(os.getenv("TRADER_MAX_ETH_EXPOSURE_CENTS", "2000"))
+
+        # available cash guard
+        try:
+            bal = requests.get(base + "/api/kalshi/portfolio/balance", timeout=30).json()
+            avail_cents = int(float(bal.get("balance", 0)) * 100)
+        except Exception:
+            avail_cents = 0
 
         # 1) get paper proposals (crypto discovery + scoring)
         try:
@@ -233,6 +244,13 @@ def main():
 
         # 3) place FoK order (limit)
         buy_max_cost = min(max_cost_trade, daily_max_cost - spent)
+        if target_spend_cents > 0:
+            buy_max_cost = min(buy_max_cost, max(0, target_spend_cents - spent))
+        if avail_cents > 0:
+            buy_max_cost = min(buy_max_cost, max(0, avail_cents - 25))  # keep small buffer
+        if buy_max_cost <= 0:
+            print("No remaining budget/cash; stopping")
+            break
         # Determine a sensible contract count that cannot exceed the max cost.
         count = max(1, buy_max_cost // max(1, price))
 
