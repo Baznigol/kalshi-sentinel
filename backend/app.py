@@ -382,6 +382,7 @@ def paper_run_today():
                 {
                     "ticker": s.ticker,
                     "title": s.title,
+                    "subtitle": m.get("subtitle"),
                     "tags": s.tags,
                     "close_time": s.close_time,
                     "score": s.score,
