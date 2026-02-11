@@ -759,18 +759,20 @@ def main():
                     _add_reject(rejects, "bad_subtitle", penalty=1.0, ticker=ticker, subtitle=sub)
                     continue
 
-                # Near-the-money bucket filter: only trade buckets close to spot.
-                # For bounded ranges, use midpoint. For one-sided buckets, use the boundary as proxy.
+                # Near-the-money bucket filter: only trade *bounded* buckets close to spot.
+                # We skip one-sided tails ("or above/below") entirely.
+                if lo is None or hi is None:
+                    stats["skips_near"] += 1
+                    _add_reject(rejects, "range_one_sided", penalty=1.0, ticker=ticker, subtitle=sub)
+                    continue
+
                 try:
                     s0 = float(spot_px)
-                    if lo is not None and hi is not None:
-                        anchor = 0.5 * (float(lo) + float(hi))
-                    else:
-                        anchor = float(lo) if lo is not None else float(hi)
+                    anchor = 0.5 * (float(lo) + float(hi))
                     rel = abs(anchor - s0) / max(1.0, s0)
                     if range_near_pct > 0 and rel > range_near_pct:
                         stats["skips_near"] += 1
-                        _add_reject(rejects, "not_near_money", penalty=(rel - range_near_pct), ticker=ticker, rel=round(rel, 6), near_pct=range_near_pct)
+                        _add_reject(rejects, "not_near_money", penalty=(rel - range_near_pct), ticker=ticker, rel=round(rel, 6), near_pct=range_near_pct, anchor=anchor, spot=s0)
                         continue
                 except Exception:
                     pass
