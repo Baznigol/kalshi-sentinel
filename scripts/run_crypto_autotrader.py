@@ -29,6 +29,45 @@ from collections import deque
 from dotenv import load_dotenv
 import requests
 
+
+def _norm_cdf(x: float) -> float:
+    # standard normal CDF via erf
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _parse_price(s: str) -> float | None:
+    try:
+        return float(str(s).replace('$','').replace(',','').strip())
+    except Exception:
+        return None
+
+
+def _parse_range_subtitle(subtitle: str) -> tuple[float | None, float | None]:
+    """Parse KXBTC range subtitles.
+
+    Examples:
+      "$78,250 or above" -> (78250, None)
+      "$59,999.99 or below" -> (None, 59999.99)
+      "$77,500 to 77,749.99" -> (77500, 77749.99)
+    """
+    if not subtitle:
+        return (None, None)
+    t = subtitle.replace('\u00a0', ' ').strip()
+    u = t.upper()
+    if "OR ABOVE" in u:
+        a = t.split("or", 1)[0]
+        return (_parse_price(a), None)
+    if "OR BELOW" in u:
+        a = t.split("or", 1)[0]
+        return (None, _parse_price(a))
+    if "TO" in u:
+        parts = t.split("to")
+        if len(parts) >= 2:
+            lo = _parse_price(parts[0])
+            hi = _parse_price(parts[1])
+            return (lo, hi)
+    return (None, None)
+
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 load_dotenv(os.path.join(REPO_DIR, "config", ".env"))
 
@@ -658,41 +697,86 @@ def main():
             # Decide direction using BTC momentum for "up in next 15 mins" markets.
             # - If momentum is positive enough -> buy YES
             # - If momentum is negative enough -> buy NO (i.e., bet NOT up)
-            # Otherwise skip.
+            # Decide side using fair probability vs market price.
             want_side = None
+            want_lottery = False
+
             # Market semantics detection
             tkr_u = str(ticker).upper()
             title_u = title.upper()
-            is_btc_up = ("BTC" in title_u and "PRICE" in title_u and "UP" in title_u)
-            is_supported = (
-                tkr_u.startswith("KXBTC15M") or  # 15-minute
-                tkr_u.startswith("KXBTC-")       # hourly-ish
-            ) and is_btc_up
+            is_btc_up_15m = tkr_u.startswith("KXBTC15M") and ("BTC" in title_u and "PRICE" in title_u and "UP" in title_u)
+            is_kxbtc_range = tkr_u.startswith("KXBTC-") and ("PRICE RANGE" in title_u)
 
-            if is_supported:
+            if spot_px is None or spot_vol_bps is None:
+                stats["skips_direction"] += 1
+                continue
+
+            # Compute p_fair_yes depending on market type
+            if is_btc_up_15m:
                 if p_fair_yes is None:
                     stats["skips_direction"] += 1
                     continue
+            elif is_kxbtc_range:
+                sub = p.get("subtitle") or ""
+                lo, hi = _parse_range_subtitle(sub)
+                if lo is None and hi is None:
+                    stats["skips_semantics"] += 1
+                    continue
 
-                # Market-implied P(YES) for buying each side at the implied ask:
-                p_mkt_yes_if_buy_yes = implied_yes_ask / 100.0
-                p_mkt_yes_if_buy_no = 1.0 - (implied_no_ask / 100.0)
+                # Horizon to close in seconds
+                try:
+                    if close_time:
+                        ct = dt.datetime.fromisoformat(str(close_time).replace('Z', '+00:00')).astimezone(dt.timezone.utc)
+                        horizon_s = max(1.0, (ct - now.astimezone(dt.timezone.utc)).total_seconds())
+                    else:
+                        horizon_s = 3600.0
+                except Exception:
+                    horizon_s = 3600.0
 
-                # Market sanity band: if extreme, allow only as a small "lottery" sized trade.
-                lot_yes = (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob)
-                lot_no = (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob)
-                if lot_yes or lot_no:
-                    stats["skips_prob_band"] += 1
+                # Drift from recent return
+                mu = 0.0
+                if spot_ret_bps is not None and momentum_lookback > 0:
+                    mu = (spot_ret_bps / 10000.0) * (horizon_s / float(momentum_lookback))
 
-                edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
-                edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0  # positive means NO is underpriced
+                # Vol scaling (treat spot_vol_bps roughly as per-minute)
+                sigma = abs(spot_vol_bps / 10000.0) * math.sqrt(horizon_s / 60.0)
+                sigma = max(1e-6, sigma)
 
-                # Require momentum nudge AND direction agreement.
+                mlog = math.log(float(spot_px)) + mu
+
+                def cdf_price(x: float) -> float:
+                    return _norm_cdf((math.log(x) - mlog) / sigma)
+
+                if lo is None:
+                    p_fair_yes = cdf_price(float(hi))
+                elif hi is None:
+                    p_fair_yes = 1.0 - cdf_price(float(lo))
+                else:
+                    p_fair_yes = max(0.0, min(1.0, cdf_price(float(hi)) - cdf_price(float(lo))))
+
+                p_fair_yes = max(0.001, min(0.999, float(p_fair_yes)))
+            else:
+                stats["skips_semantics"] += 1
+                continue
+
+            # Market-implied P(YES) for buying each side at the implied ask:
+            p_mkt_yes_if_buy_yes = implied_yes_ask / 100.0
+            p_mkt_yes_if_buy_no = 1.0 - (implied_no_ask / 100.0)
+
+            # Market sanity band: if extreme, allow only as small lottery trade.
+            lot_yes = (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob)
+            lot_no = (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob)
+            if lot_yes or lot_no:
+                stats["skips_prob_band"] += 1
+
+            edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
+            edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0
+
+            # For 15m "UP" markets, require direction agreement with momentum.
+            if is_btc_up_15m:
                 if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
                     stats["skips_direction"] += 1
                     continue
-
-                # Direction sanity: only buy YES on positive momentum; only buy NO on negative momentum.
                 if spot_ret_bps > 0:
                     if edge_bps_yes >= min_edge_bps:
                         want_side = "yes"
@@ -708,9 +792,16 @@ def main():
                         stats["skips_edge"] += 1
                         continue
             else:
-                # Unknown market semantics; skip for safety
-                stats["skips_semantics"] += 1
-                continue
+                # Range markets: pick whichever side has enough edge (no momentum sign requirement)
+                if edge_bps_yes >= min_edge_bps:
+                    want_side = "yes"
+                    want_lottery = bool(lot_yes)
+                elif edge_bps_no >= min_edge_bps:
+                    want_side = "no"
+                    want_lottery = bool(lot_no)
+                else:
+                    stats["skips_edge"] += 1
+                    continue
 
             side = want_side
             price = implied_yes_ask if side == "yes" else implied_no_ask
