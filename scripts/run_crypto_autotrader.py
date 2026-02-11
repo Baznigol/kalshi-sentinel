@@ -847,7 +847,10 @@ def main():
             if is_btc_up_15m:
                 if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
                     stats["skips_direction"] += 1
-                    _add_reject(rejects, "momentum_too_small", penalty=(momentum_threshold_bps - abs(spot_ret_bps)), ticker=ticker, ret_bps=spot_ret_bps, thr=momentum_threshold_bps)
+                    if spot_ret_bps is None:
+                        _add_reject(rejects, "no_momentum", penalty=momentum_threshold_bps, ticker=ticker, ret_bps=None, thr=momentum_threshold_bps)
+                    else:
+                        _add_reject(rejects, "momentum_too_small", penalty=(momentum_threshold_bps - abs(spot_ret_bps)), ticker=ticker, ret_bps=spot_ret_bps, thr=momentum_threshold_bps)
                     continue
                 if spot_ret_bps > 0:
                     if edge_bps_yes >= min_edge_bps:
