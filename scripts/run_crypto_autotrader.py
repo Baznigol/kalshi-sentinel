@@ -316,7 +316,15 @@ def main():
         # available cash guard
         try:
             bal = requests.get(base + "/api/kalshi/portfolio/balance", timeout=30).json()
-            avail_cents = int(float(bal.get("balance", 0)) * 100)
+            b = bal.get("balance", 0)
+            # Our backend currently returns cents (int) for balance/portfolio_value.
+            # But keep this robust in case it changes to dollars.
+            if isinstance(b, (int,)):
+                avail_cents = int(b)
+            else:
+                bf = float(b or 0)
+                # Heuristic: values < 1000 are probably dollars; otherwise cents.
+                avail_cents = int(round(bf * 100)) if bf < 1000 else int(round(bf))
         except Exception:
             avail_cents = 0
 
