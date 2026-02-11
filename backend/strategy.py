@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import datetime as dt
+import os
 
 
 POLITICS_KWS = [
@@ -157,10 +158,36 @@ def choose_universe(markets: List[Dict[str, Any]], *, hours_ahead: int = 24) -> 
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = now + dt.timedelta(hours=hours_ahead)
 
+    # Optional: prefer markets that close at specific local hours (e.g., 13,17).
+    pref = os.getenv("TRADER_PREFERRED_CLOSE_HOURS_LOCAL", "").strip()
+    preferred_hours: List[int] = []
+    if pref:
+        for part in pref.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                h = int(part)
+                if 0 <= h <= 23:
+                    preferred_hours.append(h)
+            except Exception:
+                continue
+
     scored: List[MarketScore] = []
     for m in markets:
         s = score_market(m, now_utc=now, cutoff_utc=cutoff)
         if s and s.ticker:
+            # Preferred close hour bonus
+            if preferred_hours:
+                ct = parse_iso(m.get("close_time"))
+                if ct is not None:
+                    try:
+                        local = ct.astimezone()  # server local tz
+                        if local.hour in preferred_hours:
+                            s.score += 0.75
+                            s.reasons.append("preferred_close_hour")
+                    except Exception:
+                        pass
             scored.append(s)
 
     scored.sort(key=lambda x: x.score, reverse=True)
