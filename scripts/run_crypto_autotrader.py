@@ -283,6 +283,8 @@ def main():
         "skips_spread": 0,
         "skips_poscap": 0,
         "skips_cooldown": 0,
+        "skips_depth": 0,
+        "skips_semantics": 0,
         "candidates_checked": 0,
         "orders_posted": 0,
         "order_errors": 0,
@@ -658,8 +660,18 @@ def main():
             # - If momentum is negative enough -> buy NO (i.e., bet NOT up)
             # Otherwise skip.
             want_side = None
-            if "UP" in title.upper() and "15" in title:
+            # Market semantics detection
+            tkr_u = str(ticker).upper()
+            title_u = title.upper()
+            is_btc_up = ("BTC" in title_u and "PRICE" in title_u and "UP" in title_u)
+            is_supported = (
+                tkr_u.startswith("KXBTC15M") or  # 15-minute
+                tkr_u.startswith("KXBTC-")       # hourly-ish
+            ) and is_btc_up
+
+            if is_supported:
                 if p_fair_yes is None:
+                    stats["skips_direction"] += 1
                     continue
 
                 # Market-implied P(YES) for buying each side at the implied ask:
@@ -697,6 +709,7 @@ def main():
                         continue
             else:
                 # Unknown market semantics; skip for safety
+                stats["skips_semantics"] += 1
                 continue
 
             side = want_side
@@ -756,7 +769,6 @@ def main():
                 depth_qty = 0
 
             if min_depth_within_qty > 0 and depth_qty < min_depth_within_qty:
-                stats.setdefault("skips_depth", 0)
                 stats["skips_depth"] += 1
                 continue
 
@@ -773,8 +785,8 @@ def main():
                 _log(
                     f"heartbeat loops={loops} fills={fills} net_spent_today={net_spent_today_cents}c mins_left={mins_left if mins_left is not None else '—'} "
                     f"paper_props={len(props)} checked={stats['candidates_checked']} ob_calls={stats['ob_calls']} "
-                    f"skips_edge={stats['skips_edge']} skips_dir={stats['skips_direction']} skips_prob={stats['skips_prob_band']} "
-                    f"skips_exitbid={stats['skips_no_exit_bid']} skips_spread={stats['skips_spread']} skips_qty={stats['skips_qty']} skips_price={stats['skips_price']} skips_poscap={stats['skips_poscap']} skips_cooldown={stats['skips_cooldown']}",
+                    f"skips_edge={stats['skips_edge']} skips_dir={stats['skips_direction']} skips_prob={stats['skips_prob_band']} skips_sem={stats['skips_semantics']} "
+                    f"skips_exitbid={stats['skips_no_exit_bid']} skips_spread={stats['skips_spread']} skips_depth={stats['skips_depth']} skips_qty={stats['skips_qty']} skips_price={stats['skips_price']} skips_poscap={stats['skips_poscap']} skips_cooldown={stats['skips_cooldown']}",
                     log_path=log_path,
                 )
             _log("no candidates passed gates; sleeping", log_path=log_path)
