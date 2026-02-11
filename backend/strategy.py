@@ -106,17 +106,34 @@ def score_market(m: Dict[str, Any], *, now_utc: dt.datetime, cutoff_utc: dt.date
     else:
         reasons.append("low_volume")
 
-    # Prefer closer to cutoff (today trading). Not too close (avoid end-of-life chaos).
+    # Prefer closer to cutoff. Tune specially for BTC15M markets.
     hrs = (close_t - now_utc).total_seconds() / 3600.0
-    if 0.5 <= hrs <= 12:
-        score += 2.0
-        reasons.append("closes_soon")
-    elif hrs < 0.5:
-        score -= 2.0
-        reasons.append("too_close")
+    tkr = (m.get("ticker") or "").upper()
+    is_btc15m = tkr.startswith("KXBTC15M")
+
+    if is_btc15m:
+        # For 15-minute windows we *want* near-term markets, but not the last couple minutes.
+        # 0.08h ~= 4.8 minutes.
+        if 0.08 <= hrs <= 2.0:
+            score += 2.0
+            reasons.append("closes_soon")
+        elif hrs < 0.08:
+            score -= 2.0
+            reasons.append("too_close")
+        else:
+            score += 0.5
+            reasons.append("not_too_close")
     else:
-        score += 0.5
-        reasons.append("not_too_close")
+        # Default behavior for non-15m markets
+        if 0.5 <= hrs <= 12:
+            score += 2.0
+            reasons.append("closes_soon")
+        elif hrs < 0.5:
+            score -= 2.0
+            reasons.append("too_close")
+        else:
+            score += 0.5
+            reasons.append("not_too_close")
 
     # Penalize obviously odd markets state.
     status = (m.get("status") or "").lower()

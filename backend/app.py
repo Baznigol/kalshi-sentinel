@@ -373,7 +373,28 @@ def paper_run_today():
         db.close()
 
     audit_log("INFO", "paper", "paper_run_today", {"hours_ahead": hours_ahead, "budget": budget, "max_trades": max_trades, "proposed": len(proposed)})
-    return jsonify({"proposed": proposed, "universe_count": len(universe)})
+
+    # Return small universe preview for debugging (safe: public market metadata)
+    universe_preview = [
+        {
+            "ticker": u.ticker,
+            "title": u.title,
+            "close_time": u.close_time,
+            "score": u.score,
+            "tags": u.tags,
+            "reasons": u.reasons,
+            "liquidity": u.liquidity,
+            "volume_24h": u.volume_24h,
+        }
+        for u in universe[: min(20, len(universe))]
+    ]
+
+    return jsonify({
+        "proposed": proposed,
+        "universe_count": len(universe),
+        "markets_count": len(markets),
+        "universe_preview": universe_preview,
+    })
 
 
 @app.route("/api/paper/trades")
