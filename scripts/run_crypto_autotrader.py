@@ -109,6 +109,15 @@ def _record_trade(conn, *, ticker: str, side: str, action: str, price_cents: int
     conn.commit()
 
 
+def _last_entry_ts(conn, *, ticker: str, side: str) -> str | None:
+    cur = conn.execute(
+        "SELECT ts FROM live_trades WHERE ticker=? AND side=? AND action='buy' ORDER BY id DESC LIMIT 1",
+        (ticker, side),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
 def _today_pnl(conn) -> int:
     """Realized PnL in cents for today from our local ledger.
 
@@ -141,6 +150,15 @@ def main():
     max_spread_cents = int(os.getenv("TRADER_MAX_SPREAD_CENTS", "10"))
     depth_within_cents = int(os.getenv("TRADER_DEPTH_WITHIN_CENTS", "2"))
     top_qty_fraction = float(os.getenv("TRADER_TOP_QTY_FRACTION", "0.30"))
+
+    # Edge model (fair prob vs market)
+    min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
+    fair_k = float(os.getenv("TRADER_FAIR_K", "0.8"))            # maps momentum bps -> prob shift
+    fair_vol_window = int(os.getenv("TRADER_FAIR_VOL_WINDOW_SECONDS", "300"))
+
+    # Rotation / timeout exits
+    exit_edge_eps_bps = float(os.getenv("TRADER_EXIT_EDGE_EPS_BPS", "4"))  # exit when edge compresses within 0.04%
+    max_hold_seconds = int(os.getenv("TRADER_MAX_HOLD_SECONDS", "900"))    # 15 minutes default
 
     # Exits / risk guards
     exits_enabled = os.getenv("TRADER_EXITS_ENABLED", "false").lower() == "true"
@@ -317,6 +335,8 @@ def main():
         # Spot price update (for BTC momentum signal)
         spot_px = None
         spot_ret_bps = None
+        spot_vol_bps = None
+        p_fair_yes = None
         try:
             pr = requests.get(price_feed_url, timeout=10).json()
             amt = (pr.get("data") or {}).get("amount")
@@ -334,11 +354,33 @@ def main():
                         break
                 if p0:
                     spot_ret_bps = ((spot_px / p0) - 1.0) * 10000.0
+
+                # realized vol over fair_vol_window (std of 1-step bps returns)
+                t_vol_cut = t_now - fair_vol_window
+                xs = [p for (t, p) in spot if t >= t_vol_cut]
+                if len(xs) >= 5:
+                    rets = []
+                    for i in range(1, len(xs)):
+                        if xs[i-1] > 0:
+                            rets.append(((xs[i] / xs[i-1]) - 1.0) * 10000.0)
+                    if len(rets) >= 4:
+                        mu = sum(rets) / len(rets)
+                        var = sum((r - mu) ** 2 for r in rets) / (len(rets) - 1)
+                        spot_vol_bps = math.sqrt(max(0.0, var))
+
+                # fair probability model for YES (BTC up in next 15 mins)
+                # crude but useful: start at 50%, shift by momentum scaled, damp by high vol.
+                if spot_ret_bps is not None:
+                    damp = 1.0
+                    if spot_vol_bps is not None:
+                        damp = 1.0 / (1.0 + (spot_vol_bps / 50.0))  # higher vol => less confident
+                    p_fair_yes = 0.5 + (fair_k * damp * (spot_ret_bps / 100.0))  # 100 bps -> 1.0 prob shift * k
+                    p_fair_yes = max(0.02, min(0.98, p_fair_yes))
         except Exception as e:
             _log(f"spot feed error: {e}", log_path=log_path)
 
-        # Optional exit logic (sell winners/losers)
-        if exits_enabled and (take_profit_cents > 0 or stop_loss_cents != 0):
+        # Optional exit logic (edge compression / rotation + TP/SL fallback)
+        if exits_enabled:
             try:
                 mtm = requests.get(base + "/api/status/positions_mtm", timeout=30).json()
                 rows = mtm.get("rows", []) or []
@@ -352,25 +394,47 @@ def main():
                     if pos_qty <= 0:
                         continue
                     unreal = int(r.get("unreal_pnl_cents") or 0)
-                    best_yes_bid = int(r.get("best_yes_bid") or 0)
-                    if best_yes_bid <= 0:
-                        continue
 
+                    side0 = (r.get("side") or "yes").lower()
+                    if side0 not in ("yes", "no"):
+                        side0 = "yes"
+
+                    # Edge compression: compute market-implied P(YES) from exit bid on your side.
+                    best_bid = int(r.get("best_exit_bid") or 0)
+                    if best_bid <= 0:
+                        continue
+                    if side0 == "yes":
+                        p_mkt_yes = best_bid / 100.0
+                    else:
+                        p_mkt_yes = 1.0 - (best_bid / 100.0)
+
+                    # Compute fair prob now (if unavailable, fall back to TP/SL)
+                    edge_bps_now = None
+                    if p_fair_yes is not None:
+                        edge_bps_now = (p_fair_yes - p_mkt_yes) * 10000.0
+
+                    # Rotation / timeout
+                    too_old = False
+                    try:
+                        ts = _last_entry_ts(conn, ticker=tkr, side=side0)
+                        if ts:
+                            age = (now - dt.datetime.fromisoformat(ts)).total_seconds()
+                            too_old = (max_hold_seconds > 0 and age >= max_hold_seconds)
+                    except Exception:
+                        too_old = False
+
+                    hit_edge_compress = (edge_bps_now is not None and abs(edge_bps_now) <= exit_edge_eps_bps)
                     hit_tp = (take_profit_cents > 0 and unreal >= take_profit_cents)
                     hit_sl = (stop_loss_cents != 0 and unreal <= -abs(stop_loss_cents))
-                    if not (hit_tp or hit_sl):
+
+                    if not (hit_edge_compress or too_old or hit_tp or hit_sl):
                         continue
 
                     # Sell at best bid (or a bit below if exit_max_slip is set)
                     sell_qty = pos_qty
 
-                    side = (r.get("side") or "yes").lower()
-                    if side not in ("yes", "no"):
-                        side = "yes"
+                    side = side0
 
-                    best_bid = int(r.get("best_exit_bid") or 0)
-                    if best_bid <= 0:
-                        continue
                     sell_px = max(1, best_bid - max(0, exit_max_slip))
 
                     payload = {
@@ -386,7 +450,11 @@ def main():
                     else:
                         payload["no_price"] = sell_px
 
-                    _log(f"EXIT signal: {tkr} SELL {side.upper()} qty={sell_qty} @ {sell_px}c (best={best_bid} slip={exit_max_slip}) unreal={unreal}c", log_path=log_path)
+                    _log(
+                        f"EXIT signal: {tkr} SELL {side.upper()} qty={sell_qty} @ {sell_px}c (best={best_bid} slip={exit_max_slip}) "
+                        f"unreal={unreal}c edge_bps={edge_bps_now if edge_bps_now is not None else '—'} too_old={too_old}",
+                        log_path=log_path,
+                    )
                     resp = requests.post(base + "/api/kalshi/orders", json=payload, timeout=60)
                     try:
                         data = resp.json()
@@ -505,19 +573,28 @@ def main():
             # Otherwise skip.
             want_side = None
             if "UP" in title.upper() and "15" in title:
-                if spot_ret_bps is not None:
-                    if spot_ret_bps >= momentum_threshold_bps:
-                        want_side = "yes"
-                    elif spot_ret_bps <= -momentum_threshold_bps:
-                        want_side = "no"
+                if p_fair_yes is None:
+                    continue
+
+                # Market-implied P(YES) for buying each side at the implied ask:
+                p_mkt_yes_if_buy_yes = implied_yes_ask / 100.0
+                p_mkt_yes_if_buy_no = 1.0 - (implied_no_ask / 100.0)
+
+                edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
+                edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0  # positive means NO is underpriced
+
+                # Require both a momentum nudge (avoid pure noise) AND an edge threshold.
+                if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
+                    continue
+
+                if edge_bps_yes >= min_edge_bps:
+                    want_side = "yes"
+                elif edge_bps_no >= min_edge_bps:
+                    want_side = "no"
                 else:
-                    # No signal -> skip
-                    want_side = None
+                    continue
             else:
                 # Unknown market semantics; skip for safety
-                want_side = None
-
-            if not want_side:
                 continue
 
             side = want_side
@@ -575,9 +652,15 @@ def main():
         side = chosen_side
         price = chosen_price
 
+        # Market-implied P(YES) for the chosen order
+        p_mkt_yes = (price / 100.0) if side == "yes" else (1.0 - (price / 100.0))
+        edge_bps = None
+        if p_fair_yes is not None:
+            edge_bps = (p_fair_yes - p_mkt_yes) * 10000.0
+
         _log(
-            f"select ticker={ticker} side={side.upper()} px={price}c title={chosen_title!r} close={chosen_close_time} "
-            f"spot={spot_px if spot_px is not None else '—'} ret_bps={spot_ret_bps if spot_ret_bps is not None else '—'}",
+            f"select ticker={ticker} side={side.upper()} px={price}c p_mkt_yes={p_mkt_yes:.3f} p_fair_yes={p_fair_yes if p_fair_yes is not None else '—'} edge_bps={edge_bps if edge_bps is not None else '—'} "
+            f"title={chosen_title!r} close={chosen_close_time} spot={spot_px if spot_px is not None else '—'} ret_bps={spot_ret_bps if spot_ret_bps is not None else '—'} vol_bps={spot_vol_bps if spot_vol_bps is not None else '—'}",
             log_path=log_path,
         )
 
@@ -681,6 +764,16 @@ def main():
                 f"tif={payload.get('time_in_force')}",
                 log_path=log_path,
             )
+            if isinstance(data, dict):
+                data = dict(data)
+                data.setdefault("_meta", {})
+                data["_meta"].update({
+                    "p_fair_yes": p_fair_yes,
+                    "p_mkt_yes": p_mkt_yes,
+                    "edge_bps": edge_bps,
+                    "spot_ret_bps": spot_ret_bps,
+                    "spot_vol_bps": spot_vol_bps,
+                })
             _record_trade(conn, ticker=ticker, side=side, action="buy", price_cents=price, qty=filled_qty, cost_cents=trade_cost, order_id=(data.get('order') or {}).get('order_id') if isinstance(data, dict) else None, raw=data)
             _send_telegram(f"Kalshi Sentinel FILL: {ticker} BUY {side.upper()} qty={filled_qty} @ {price}c cost={trade_cost}c")
 
