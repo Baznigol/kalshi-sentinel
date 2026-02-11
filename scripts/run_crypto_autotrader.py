@@ -192,6 +192,87 @@ def _today_pnl(conn) -> int:
     return int(v or 0)
 
 
+def _session_profile(now_local: dt.datetime) -> tuple[str, dict]:
+    """Return (profile_name, overrides) based on local time.
+
+    Profiles follow the Polymarket-style BTC session breakdown (EST):
+    - ASIAN: 19:00–03:00
+    - LONDON_KZ: 02:00–05:00 (priority over ASIAN when overlapping)
+    - NY_OPEN: 07:00–11:00
+    - LONDON_CLOSE: 10:00–12:00 (priority over NY_OPEN when overlapping)
+    - DEFAULT: everything else
+
+    Overrides are read from env with sane defaults.
+    """
+    h = int(now_local.hour)
+
+    def envf(key: str, default: float) -> float:
+        try:
+            return float(os.getenv(key, str(default)))
+        except Exception:
+            return float(default)
+
+    def envi(key: str, default: int) -> int:
+        try:
+            return int(float(os.getenv(key, str(default))))
+        except Exception:
+            return int(default)
+
+    # base defaults (fallback)
+    base = {
+        "min_edge_bps": envf("TRADER_MIN_EDGE_BPS", 12),
+        "max_spread_cents": envi("TRADER_MAX_SPREAD_CENTS", 10),
+        "min_top_qty": envi("TRADER_MIN_TOP_QTY", 15),
+        "min_depth_within_qty": envi("TRADER_MIN_DEPTH_WITHIN_QTY", 30),
+        "max_hold_seconds": envi("TRADER_MAX_HOLD_SECONDS", 300),
+        "exit_max_slip": envi("TRADER_EXIT_MAX_SLIPPAGE_CENTS", 2),
+    }
+
+    # choose profile with priorities
+    name = "DEFAULT"
+    if 10 <= h < 12:
+        name = "LONDON_CLOSE"
+    elif 7 <= h < 11:
+        name = "NY_OPEN"
+    elif 2 <= h < 5:
+        name = "LONDON_KZ"
+    elif (h >= 19) or (h < 3):
+        name = "ASIAN"
+
+    # profile deltas (bounded adjustments):
+    # Read from env; defaults chosen to be conservative.
+    if name == "ASIAN":
+        return name, {
+            **base,
+            "min_edge_bps": envf("TRADER_PROFILE_ASIAN_MIN_EDGE_BPS", max(base["min_edge_bps"], 12)),
+            "max_spread_cents": envi("TRADER_PROFILE_ASIAN_MAX_SPREAD_CENTS", min(base["max_spread_cents"], 10)),
+            "max_hold_seconds": envi("TRADER_PROFILE_ASIAN_MAX_HOLD_SECONDS", min(base["max_hold_seconds"], 240)),
+        }
+    if name == "LONDON_KZ":
+        return name, {
+            **base,
+            "min_edge_bps": envf("TRADER_PROFILE_LONDON_KZ_MIN_EDGE_BPS", max(10, base["min_edge_bps"] - 2)),
+            "max_spread_cents": envi("TRADER_PROFILE_LONDON_KZ_MAX_SPREAD_CENTS", base["max_spread_cents"]),
+            "max_hold_seconds": envi("TRADER_PROFILE_LONDON_KZ_MAX_HOLD_SECONDS", base["max_hold_seconds"]),
+        }
+    if name == "NY_OPEN":
+        return name, {
+            **base,
+            "min_edge_bps": envf("TRADER_PROFILE_NY_OPEN_MIN_EDGE_BPS", max(10, base["min_edge_bps"] - 2)),
+            "max_spread_cents": envi("TRADER_PROFILE_NY_OPEN_MAX_SPREAD_CENTS", max(base["max_spread_cents"], 12)),
+            "max_hold_seconds": envi("TRADER_PROFILE_NY_OPEN_MAX_HOLD_SECONDS", base["max_hold_seconds"]),
+        }
+    if name == "LONDON_CLOSE":
+        return name, {
+            **base,
+            "min_edge_bps": envf("TRADER_PROFILE_LONDON_CLOSE_MIN_EDGE_BPS", max(base["min_edge_bps"], 12)),
+            "max_spread_cents": envi("TRADER_PROFILE_LONDON_CLOSE_MAX_SPREAD_CENTS", base["max_spread_cents"]),
+            "max_hold_seconds": envi("TRADER_PROFILE_LONDON_CLOSE_MAX_HOLD_SECONDS", min(base["max_hold_seconds"], 240)),
+        }
+
+    return name, base
+
+
 def main():
     if os.getenv("AUTO_TRADING_ENABLED", "false").lower() != "true":
         print("AUTO_TRADING_ENABLED is false; refusing to trade.")
@@ -215,6 +296,8 @@ def main():
     top_qty_fraction = float(os.getenv("TRADER_TOP_QTY_FRACTION", "0.30"))
     range_near_pct = float(os.getenv("TRADER_RANGE_NEAR_PCT", "0.01"))
     range_spot_in_bucket_buffer = float(os.getenv("TRADER_RANGE_SPOT_IN_BUCKET_BUFFER", "25"))
+
+    session_profiles_enabled = os.getenv("TRADER_SESSION_PROFILES", "false").lower() == "true"
 
     # Edge model (fair prob vs market)
     min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
@@ -408,6 +491,22 @@ def main():
         # SIMPLE mode: always attempt a BTC15M trade each cycle (best-effort), with minimal sizing.
         # We keep safety rails: allowlist, limit orders, max-loss caps, liquidity gates.
         simple_force_trade = (trader_mode == "simple")
+
+        # Time-of-day session profiles (optional). This adjusts a small set of knobs automatically.
+        if session_profiles_enabled:
+            prof_name, prof = _session_profile(now)
+            # apply overrides to effective knobs for THIS loop only
+            min_edge_bps = float(prof.get("min_edge_bps", min_edge_bps))
+            max_spread_cents = int(prof.get("max_spread_cents", max_spread_cents))
+            min_top_qty = int(prof.get("min_top_qty", min_top_qty))
+            min_depth_within_qty = int(prof.get("min_depth_within_qty", min_depth_within_qty))
+            max_hold_seconds = int(prof.get("max_hold_seconds", max_hold_seconds))
+            exit_max_slip = int(prof.get("exit_max_slip", exit_max_slip))
+            if loops % heartbeat_every == 0:
+                _log(
+                    f"profile={prof_name} knobs: min_edge_bps={min_edge_bps} max_spread={max_spread_cents} min_top_qty={min_top_qty} min_depth_qty={min_depth_within_qty} max_hold={max_hold_seconds}s exit_slip={exit_max_slip}c",
+                    log_path=log_path,
+                )
 
         mins_left = None
         if cutoff:
