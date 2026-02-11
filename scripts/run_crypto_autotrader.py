@@ -403,14 +403,6 @@ def main():
         min_top_qty = base_min_top_qty
         tif = "fill_or_kill"
 
-        # Entries disabled close to expiry (rotation mode): exits may still run.
-        entries_enabled = True
-        try:
-            if min_minutes_to_close > 0 and mins_left is not None and mins_left < min_minutes_to_close:
-                entries_enabled = False
-        except Exception:
-            pass
-
         mins_left = None
         if cutoff:
             # informational only (no hard stop)
@@ -419,6 +411,14 @@ def main():
             except Exception:
                 mins_left = None
 
+        # Entries disabled close to expiry (rotation mode): exits may still run.
+        entries_enabled = True
+        try:
+            if min_minutes_to_close > 0 and mins_left is not None and mins_left < min_minutes_to_close:
+                entries_enabled = False
+        except Exception:
+            pass
+
         # 0) position-aware throttling (avoid stacking correlated BTC/ETH exposure)
         try:
             pos = requests.get(base + "/api/kalshi/portfolio/positions", timeout=30).json()
@@ -426,6 +426,17 @@ def main():
             btc_exposure = sum(int(x.get("market_exposure") or 0) for x in mpos if str(x.get("ticker","")).startswith("KXBTC") or str(x.get("ticker","")).startswith("KXBTCD"))
             eth_exposure = sum(int(x.get("market_exposure") or 0) for x in mpos if str(x.get("ticker","")).startswith("KXETH"))
             pos_by_ticker = {str(x.get("ticker")): int(float(x.get("position_fp") or x.get("position") or 0)) for x in mpos if x.get("ticker")}
+
+            # WIN filter: optionally require flat book before entering new positions.
+            require_flat = os.getenv("TRADER_ENTRIES_REQUIRE_FLAT", "true").lower() == "true"
+            if require_flat:
+                open_qty = 0
+                for tkr, q in pos_by_ticker.items():
+                    if allow_prefixes and not any(str(tkr).startswith(px) for px in allow_prefixes):
+                        continue
+                    open_qty += abs(int(q))
+                if open_qty > 0:
+                    entries_enabled = False
         except Exception:
             btc_exposure = 0
             eth_exposure = 0
