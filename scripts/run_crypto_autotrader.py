@@ -324,6 +324,7 @@ def main():
         "skips_cooldown": 0,
         "skips_depth": 0,
         "skips_semantics": 0,
+        "skips_near": 0,
         "candidates_checked": 0,
         "orders_posted": 0,
         "order_errors": 0,
@@ -723,6 +724,21 @@ def main():
                     stats["skips_semantics"] += 1
                     continue
 
+                # Near-the-money bucket filter: only trade buckets close to spot.
+                # For bounded ranges, use midpoint. For one-sided buckets, use the boundary as proxy.
+                try:
+                    s0 = float(spot_px)
+                    if lo is not None and hi is not None:
+                        anchor = 0.5 * (float(lo) + float(hi))
+                    else:
+                        anchor = float(lo) if lo is not None else float(hi)
+                    rel = abs(anchor - s0) / max(1.0, s0)
+                    if range_near_pct > 0 and rel > range_near_pct:
+                        stats["skips_near"] += 1
+                        continue
+                except Exception:
+                    pass
+
                 # Horizon to close in seconds
                 try:
                     if close_time:
@@ -882,7 +898,7 @@ def main():
                 _log(
                     f"heartbeat loops={loops} fills={fills} net_spent_today={net_spent_today_cents}c mins_left={mins_left if mins_left is not None else '—'} "
                     f"paper_props={len(props)} checked={stats['candidates_checked']} ob_calls={stats['ob_calls']} "
-                    f"skips_edge={stats['skips_edge']} skips_dir={stats['skips_direction']} skips_prob={stats['skips_prob_band']} skips_sem={stats['skips_semantics']} "
+                    f"skips_edge={stats['skips_edge']} skips_dir={stats['skips_direction']} skips_prob={stats['skips_prob_band']} skips_sem={stats['skips_semantics']} skips_near={stats['skips_near']} "
                     f"skips_exitbid={stats['skips_no_exit_bid']} skips_spread={stats['skips_spread']} skips_depth={stats['skips_depth']} skips_qty={stats['skips_qty']} skips_price={stats['skips_price']} skips_poscap={stats['skips_poscap']} skips_cooldown={stats['skips_cooldown']}",
                     log_path=log_path,
                 )
