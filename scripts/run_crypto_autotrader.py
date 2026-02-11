@@ -205,6 +205,10 @@ def main():
     if candidates_to_check <= 0:
         candidates_to_check = 25
 
+    # Avoid ping-pong / overtrading the same ticker
+    ticker_cooldown_seconds = int(os.getenv("TRADER_TICKER_COOLDOWN_SECONDS", "90"))
+    last_trade_ts_by_ticker = {}
+
     # Optional stop conditions (default disabled)
     max_trades = int(os.getenv("TRADER_MAX_TRADES", "0"))
     target_trades = int(os.getenv("TRADER_TARGET_TRADES", "0"))
@@ -270,6 +274,14 @@ def main():
         "skips_qty": 0,
         "skips_allow": 0,
         "skips_exposure": 0,
+        "skips_edge": 0,
+        "skips_direction": 0,
+        "skips_prob_band": 0,
+        "skips_lottery_cap": 0,
+        "skips_no_exit_bid": 0,
+        "skips_spread": 0,
+        "skips_poscap": 0,
+        "skips_cooldown": 0,
         "candidates_checked": 0,
         "orders_posted": 0,
         "order_errors": 0,
@@ -587,11 +599,17 @@ def main():
                 stats["skips_allow"] += 1
                 continue
 
+            # cooldown gate
+            if ticker_cooldown_seconds > 0:
+                last_ts = last_trade_ts_by_ticker.get(str(ticker))
+                if last_ts is not None and (time.time() - last_ts) < ticker_cooldown_seconds:
+                    stats["skips_cooldown"] += 1
+                    continue
+
             # per-ticker position cap gate
             if max_pos_per_ticker > 0:
                 cur_pos = abs(int(pos_by_ticker.get(str(ticker), 0) or 0))
                 if cur_pos >= max_pos_per_ticker:
-                    stats.setdefault("skips_poscap", 0)
                     stats["skips_poscap"] += 1
                     continue
 
@@ -642,12 +660,15 @@ def main():
                 # Market sanity band: if extreme, allow only as a small "lottery" sized trade.
                 lot_yes = (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob)
                 lot_no = (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob)
+                if lot_yes or lot_no:
+                    stats["skips_prob_band"] += 1
 
                 edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
                 edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0  # positive means NO is underpriced
 
                 # Require momentum nudge AND direction agreement.
                 if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
+                    stats["skips_direction"] += 1
                     continue
 
                 # Direction sanity: only buy YES on positive momentum; only buy NO on negative momentum.
@@ -656,12 +677,14 @@ def main():
                         want_side = "yes"
                         want_lottery = bool(lot_yes)
                     else:
+                        stats["skips_edge"] += 1
                         continue
                 else:
                     if edge_bps_no >= min_edge_bps:
                         want_side = "no"
                         want_lottery = bool(lot_no)
                     else:
+                        stats["skips_edge"] += 1
                         continue
             else:
                 # Unknown market semantics; skip for safety
@@ -673,7 +696,6 @@ def main():
             # Rotation requirement: ensure there is at least some exit bid liquidity on our side.
             exit_bid = best_yes_bid if side == "yes" else best_no_bid
             if min_exit_bid_cents > 0 and exit_bid < min_exit_bid_cents:
-                stats.setdefault("skips_no_exit_bid", 0)
                 stats["skips_no_exit_bid"] += 1
                 continue
 
@@ -681,7 +703,6 @@ def main():
             if max_spread_cents > 0:
                 spr = spread_yes if side == "yes" else spread_no
                 if spr > max_spread_cents:
-                    stats.setdefault("skips_spread", 0)
                     stats["skips_spread"] += 1
                     continue
 
@@ -719,7 +740,9 @@ def main():
             if loops % heartbeat_every == 0:
                 _log(
                     f"heartbeat loops={loops} fills={fills} net_spent_today={net_spent_today_cents}c mins_left={mins_left if mins_left is not None else '—'} "
-                    f"paper_props={len(props)} checked={stats['candidates_checked']} ob_calls={stats['ob_calls']} skips_price={stats['skips_price']} skips_qty={stats['skips_qty']}",
+                    f"paper_props={len(props)} checked={stats['candidates_checked']} ob_calls={stats['ob_calls']} "
+                    f"skips_edge={stats['skips_edge']} skips_dir={stats['skips_direction']} skips_prob={stats['skips_prob_band']} "
+                    f"skips_exitbid={stats['skips_no_exit_bid']} skips_spread={stats['skips_spread']} skips_qty={stats['skips_qty']} skips_price={stats['skips_price']} skips_poscap={stats['skips_poscap']} skips_cooldown={stats['skips_cooldown']}",
                     log_path=log_path,
                 )
             _log("no candidates passed gates; sleeping", log_path=log_path)
@@ -836,6 +859,7 @@ def main():
         if filled_qty <= 0:
             _log(f"NO FILL: {ticker} {side.upper()} @ {price}c tif={payload.get('time_in_force')}", log_path=log_path)
         else:
+            last_trade_ts_by_ticker[str(ticker)] = time.time()
             trade_cost = filled_cost if filled_cost is not None else payload["buy_max_cost"]
             fills += 1
             stats["fills"] = fills
