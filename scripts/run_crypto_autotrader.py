@@ -155,6 +155,13 @@ def main():
     min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
     fair_k = float(os.getenv("TRADER_FAIR_K", "0.8"))            # maps momentum bps -> prob shift
     fair_vol_window = int(os.getenv("TRADER_FAIR_VOL_WINDOW_SECONDS", "300"))
+    fair_max_shift_prob = float(os.getenv("TRADER_FAIR_MAX_SHIFT_PROB", "0.03"))  # cap |p_fair-0.5|
+
+    # Rotation entry/exit liquidity
+    min_exit_bid_cents = int(os.getenv("TRADER_MIN_EXIT_BID_CENTS", "1"))
+
+    # Per-ticker position cap (contracts)
+    max_pos_per_ticker = int(os.getenv("TRADER_MAX_POSITION_PER_TICKER", "80"))
 
     # Rotation / timeout exits
     exit_edge_eps_bps = float(os.getenv("TRADER_EXIT_EDGE_EPS_BPS", "4"))  # exit when edge compresses within 0.04%
@@ -306,9 +313,11 @@ def main():
             mpos = pos.get("market_positions", []) or []
             btc_exposure = sum(int(x.get("market_exposure") or 0) for x in mpos if str(x.get("ticker","")).startswith("KXBTC") or str(x.get("ticker","")).startswith("KXBTCD"))
             eth_exposure = sum(int(x.get("market_exposure") or 0) for x in mpos if str(x.get("ticker","")).startswith("KXETH"))
+            pos_by_ticker = {str(x.get("ticker")): int(float(x.get("position_fp") or x.get("position") or 0)) for x in mpos if x.get("ticker")}
         except Exception:
             btc_exposure = 0
             eth_exposure = 0
+            pos_by_ticker = {}
 
         max_btc = int(os.getenv("TRADER_MAX_BTC_EXPOSURE_CENTS", "2000"))
         max_eth = int(os.getenv("TRADER_MAX_ETH_EXPOSURE_CENTS", "2000"))
@@ -377,12 +386,20 @@ def main():
                         spot_vol_bps = math.sqrt(max(0.0, var))
 
                 # fair probability model for YES (BTC up in next 15 mins)
-                # crude but useful: start at 50%, shift by momentum scaled, damp by high vol.
+                # Start at 50%, shift by momentum (in bps) scaled down to probability units.
+                # IMPORTANT: bps -> fraction uses /10000, not /100.
                 if spot_ret_bps is not None:
                     damp = 1.0
                     if spot_vol_bps is not None:
                         damp = 1.0 / (1.0 + (spot_vol_bps / 50.0))  # higher vol => less confident
-                    p_fair_yes = 0.5 + (fair_k * damp * (spot_ret_bps / 100.0))  # 100 bps -> 1.0 prob shift * k
+
+                    shift = fair_k * damp * (spot_ret_bps / 10000.0)
+                    # cap the shift so we don't hallucinate huge edges on tiny moves
+                    cap = abs(fair_max_shift_prob)
+                    if cap > 0:
+                        shift = max(-cap, min(cap, shift))
+
+                    p_fair_yes = 0.5 + shift
                     p_fair_yes = max(0.02, min(0.98, p_fair_yes))
         except Exception as e:
             _log(f"spot feed error: {e}", log_path=log_path)
@@ -544,6 +561,14 @@ def main():
                 stats["skips_allow"] += 1
                 continue
 
+            # per-ticker position cap gate
+            if max_pos_per_ticker > 0:
+                cur_pos = abs(int(pos_by_ticker.get(str(ticker), 0) or 0))
+                if cur_pos >= max_pos_per_ticker:
+                    stats.setdefault("skips_poscap", 0)
+                    stats["skips_poscap"] += 1
+                    continue
+
             # exposure gate
             if str(ticker).startswith("KXETH") and eth_exposure >= max_eth:
                 stats["skips_exposure"] += 1
@@ -607,6 +632,13 @@ def main():
 
             side = want_side
             price = implied_yes_ask if side == "yes" else implied_no_ask
+
+            # Rotation requirement: ensure there is at least some exit bid liquidity on our side.
+            exit_bid = best_yes_bid if side == "yes" else best_no_bid
+            if min_exit_bid_cents > 0 and exit_bid < min_exit_bid_cents:
+                stats.setdefault("skips_no_exit_bid", 0)
+                stats["skips_no_exit_bid"] += 1
+                continue
 
             # Spread gate (avoid toxic / too wide markets)
             if max_spread_cents > 0:
