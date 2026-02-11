@@ -211,6 +211,8 @@ def main():
     depth_within_cents = int(os.getenv("TRADER_DEPTH_WITHIN_CENTS", "2"))
     min_depth_within_qty = int(os.getenv("TRADER_MIN_DEPTH_WITHIN_QTY", "50"))
     top_qty_fraction = float(os.getenv("TRADER_TOP_QTY_FRACTION", "0.30"))
+    range_near_pct = float(os.getenv("TRADER_RANGE_NEAR_PCT", "0.01"))
+    range_spot_in_bucket_buffer = float(os.getenv("TRADER_RANGE_SPOT_IN_BUCKET_BUFFER", "25"))
 
     # Edge model (fair prob vs market)
     min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
@@ -768,6 +770,15 @@ def main():
 
                 try:
                     s0 = float(spot_px)
+                    # Additional safety: only trade if spot is inside the bucket (±buffer).
+                    buf = float(range_spot_in_bucket_buffer)
+                    if s0 < (float(lo) - buf) or s0 > (float(hi) + buf):
+                        stats["skips_near"] += 1
+                        # penalty = distance outside bucket in $ terms
+                        dist = (float(lo) - buf - s0) if s0 < (float(lo) - buf) else (s0 - (float(hi) + buf))
+                        _add_reject(rejects, "spot_not_in_bucket", penalty=float(dist), ticker=ticker, spot=s0, lo=float(lo), hi=float(hi), buf=buf)
+                        continue
+
                     anchor = 0.5 * (float(lo) + float(hi))
                     rel = abs(anchor - s0) / max(1.0, s0)
                     if range_near_pct > 0 and rel > range_near_pct:
