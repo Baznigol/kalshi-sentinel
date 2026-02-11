@@ -12,6 +12,7 @@ from audit import log as audit_log
 from strategy import choose_universe
 from status import positions_mtm
 from report import ledger_summary
+from performance import kalshi_performance
 import json
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -156,6 +157,18 @@ def report_ledger():
     except Exception as e:
         audit_log("ERROR", "report", "ledger_failed", {"error": str(e)})
         return jsonify({"error": "ledger_failed", "details": str(e)[:500]}), 500
+
+
+@app.route("/api/report/kalshi_performance")
+def report_kalshi_performance():
+    kc = KalshiClient.from_env()
+    try:
+        hours = int(request.args.get("hours", "24"))
+        limit = int(request.args.get("limit", "200"))
+        return jsonify(kalshi_performance(kc, hours=hours, limit=limit))
+    except Exception as e:
+        audit_log("ERROR", "report", "kalshi_performance_failed", {"error": str(e)})
+        return jsonify({"error": "kalshi_performance_failed", "details": str(e)[:500]}), 500
 
 
 @app.route("/api/kalshi/orders", methods=["POST"])
