@@ -153,6 +153,8 @@ def main():
 
     # Edge model (fair prob vs market)
     min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
+    min_mkt_prob = float(os.getenv("TRADER_MIN_MKT_PROB", "0.12"))
+    max_mkt_prob = float(os.getenv("TRADER_MAX_MKT_PROB", "0.88"))
     fair_k = float(os.getenv("TRADER_FAIR_K", "0.8"))            # maps momentum bps -> prob shift
     fair_vol_window = int(os.getenv("TRADER_FAIR_VOL_WINDOW_SECONDS", "300"))
     fair_max_shift_prob = float(os.getenv("TRADER_FAIR_MAX_SHIFT_PROB", "0.03"))  # cap |p_fair-0.5|
@@ -613,19 +615,30 @@ def main():
                 p_mkt_yes_if_buy_yes = implied_yes_ask / 100.0
                 p_mkt_yes_if_buy_no = 1.0 - (implied_no_ask / 100.0)
 
+                # Market sanity band: skip extreme prices unless you intentionally want lottery tickets.
+                if (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob):
+                    continue
+                if (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob):
+                    continue
+
                 edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
                 edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0  # positive means NO is underpriced
 
-                # Require both a momentum nudge (avoid pure noise) AND an edge threshold.
+                # Require momentum nudge AND direction agreement.
                 if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
                     continue
 
-                if edge_bps_yes >= min_edge_bps:
-                    want_side = "yes"
-                elif edge_bps_no >= min_edge_bps:
-                    want_side = "no"
+                # Direction sanity: only buy YES on positive momentum; only buy NO on negative momentum.
+                if spot_ret_bps > 0:
+                    if edge_bps_yes >= min_edge_bps:
+                        want_side = "yes"
+                    else:
+                        continue
                 else:
-                    continue
+                    if edge_bps_no >= min_edge_bps:
+                        want_side = "no"
+                    else:
+                        continue
             else:
                 # Unknown market semantics; skip for safety
                 continue
