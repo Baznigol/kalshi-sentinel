@@ -216,6 +216,13 @@ def main():
     min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
     min_mkt_prob = float(os.getenv("TRADER_MIN_MKT_PROB", "0.12"))
     max_mkt_prob = float(os.getenv("TRADER_MAX_MKT_PROB", "0.88"))
+
+    # Optional: separate prob bands for different market types
+    min_mkt_prob_up = float(os.getenv("TRADER_MIN_MKT_PROB_UP", str(min_mkt_prob)))
+    max_mkt_prob_up = float(os.getenv("TRADER_MAX_MKT_PROB_UP", str(max_mkt_prob)))
+    min_mkt_prob_range = float(os.getenv("TRADER_MIN_MKT_PROB_RANGE", str(min_mkt_prob)))
+    max_mkt_prob_range = float(os.getenv("TRADER_MAX_MKT_PROB_RANGE", str(max_mkt_prob)))
+
     lottery_max_cost_cents = int(os.getenv("TRADER_LOTTERY_MAX_COST_CENTS", "300"))
     fair_k = float(os.getenv("TRADER_FAIR_K", "0.8"))            # maps momentum bps -> prob shift
     fair_vol_window = int(os.getenv("TRADER_FAIR_VOL_WINDOW_SECONDS", "300"))
@@ -813,16 +820,24 @@ def main():
             p_mkt_yes_if_buy_no = 1.0 - (implied_no_ask / 100.0)
 
             # Market sanity band: if extreme, allow only as small lottery trade.
-            lot_yes = (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob)
-            lot_no = (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob)
+            # Use split bands by market type.
+            if is_btc_up_15m:
+                band_lo, band_hi = min_mkt_prob_up, max_mkt_prob_up
+                band_tag = "up"
+            else:
+                band_lo, band_hi = min_mkt_prob_range, max_mkt_prob_range
+                band_tag = "range"
+
+            lot_yes = (p_mkt_yes_if_buy_yes < band_lo) or (p_mkt_yes_if_buy_yes > band_hi)
+            lot_no = (p_mkt_yes_if_buy_no < band_lo) or (p_mkt_yes_if_buy_no > band_hi)
             if lot_yes or lot_no:
                 stats["skips_prob_band"] += 1
                 # HARD GATE: if lottery mode is disabled (cap <= 0), do not trade outside the band.
                 if lottery_max_cost_cents <= 0:
                     # distance to band (0 means inside)
                     p = p_mkt_yes_if_buy_yes if lot_yes else p_mkt_yes_if_buy_no
-                    dist = (min_mkt_prob - p) if p < min_mkt_prob else (p - max_mkt_prob)
-                    _add_reject(rejects, "prob_band", penalty=float(dist), ticker=ticker, p=float(p), band=[min_mkt_prob, max_mkt_prob])
+                    dist = (band_lo - p) if p < band_lo else (p - band_hi)
+                    _add_reject(rejects, "prob_band", penalty=float(dist), ticker=ticker, p=float(p), band=[band_lo, band_hi], band_type=band_tag)
                     continue
 
             edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
