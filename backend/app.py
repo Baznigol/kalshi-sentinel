@@ -276,19 +276,30 @@ def paper_run_today():
     series = _discover_crypto_series(kc)
     markets = []
 
-    # If caller is forcing a narrow prefix like KXBTC15M, we must scan more series; it may not appear in the first 15.
-    series_cap = 15
-    if ticker_prefixes and any(p.startswith("KXBTC15M") for p in ticker_prefixes):
-        series_cap = 80
+    # If caller provides a concrete series prefix like KXBTC15M, fetch that series directly.
+    direct_series = [p for p in ticker_prefixes if p and p.isupper() and p.startswith("KX") and ("-" not in p)]
+    if direct_series:
+        for st in direct_series:
+            try:
+                markets.extend(_fetch_markets_for_series(kc, st))
+            except Exception as e:
+                audit_log("WARN", "discover", "series_fetch_failed", {"series_ticker": st, "error": str(e)})
 
-    for s in series[:series_cap]:
-        st = s.get("ticker")
-        if not st:
-            continue
-        try:
-            markets.extend(_fetch_markets_for_series(kc, st))
-        except Exception as e:
-            audit_log("WARN", "discover", "series_fetch_failed", {"series_ticker": st, "error": str(e)})
+    # If markets still empty, scan discovered crypto series.
+    if not markets:
+        # If caller is forcing a narrow prefix like KXBTC15M, we must scan more series; it may not appear in the first 15.
+        series_cap = 15
+        if ticker_prefixes and any(p.startswith("KXBTC15M") for p in ticker_prefixes):
+            series_cap = 80
+
+        for s in series[:series_cap]:
+            st = s.get("ticker")
+            if not st:
+                continue
+            try:
+                markets.extend(_fetch_markets_for_series(kc, st))
+            except Exception as e:
+                audit_log("WARN", "discover", "series_fetch_failed", {"series_ticker": st, "error": str(e)})
 
     # Optional ticker prefix filter (useful for forcing BTC15M-only, etc.)
     if ticker_prefixes:
