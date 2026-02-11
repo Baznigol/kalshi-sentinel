@@ -437,6 +437,7 @@ def main():
                     open_qty += abs(int(q))
                 if open_qty > 0:
                     entries_enabled = False
+                    _log(f"WIN filter: open positions qty={open_qty}; entry paused (exit-only)", log_path=log_path)
         except Exception:
             btc_exposure = 0
             eth_exposure = 0
@@ -484,11 +485,26 @@ def main():
         spot_vol_bps = None
         p_fair_yes = None
         try:
-            pr = requests.get(price_feed_url, timeout=10).json()
-            amt = (pr.get("data") or {}).get("amount")
+            pr = requests.get(price_feed_url, timeout=10)
+            prj = pr.json()
+            amt = (prj.get("data") or {}).get("amount")
             if amt is not None:
                 spot_px = float(amt)
                 spot.append((time.time(), spot_px))
+        except Exception as e:
+            # If the feed is temporarily down (e.g., DNS), reuse the last spot to avoid total shutdown.
+            try:
+                if spot:
+                    spot_px = float(spot[-1][1])
+            except Exception:
+                spot_px = None
+            _log(f"spot feed error: {e}", log_path=log_path)
+
+        if spot_px is not None:
+            try:
+                # keep a fresh timestamp even if we reused last price
+                if not spot or spot[-1][1] != spot_px:
+                    spot.append((time.time(), spot_px))
 
                 # compute lookback return
                 t_now = spot[-1][0]
@@ -530,8 +546,8 @@ def main():
 
                     p_fair_yes = 0.5 + shift
                     p_fair_yes = max(0.02, min(0.98, p_fair_yes))
-        except Exception as e:
-            _log(f"spot feed error: {e}", log_path=log_path)
+            except Exception as e:
+                _log(f"spot feature calc error: {e}", log_path=log_path)
 
         # Optional exit logic (edge compression / rotation + TP/SL fallback)
         if exits_enabled:
@@ -653,7 +669,12 @@ def main():
                 },
                 timeout=30,
             )
-            j = r.json()
+            try:
+                j = r.json()
+            except Exception:
+                _log(f"paper non-json: status={r.status_code} body={(r.text or '')[:200]}", log_path=log_path)
+                time.sleep(interval)
+                continue
             props = j.get("proposed", [])
         except Exception as e:
             _log(f"paper error: {e}", log_path=log_path)
@@ -1011,7 +1032,13 @@ def main():
         p_mkt_yes = (price / 100.0) if side == "yes" else (1.0 - (price / 100.0))
         edge_bps = None
         if p_fair_yes is not None:
-            edge_bps = (p_fair_yes - p_mkt_yes) * 10000.0
+            # Define edge in the direction of the chosen side.
+            # - If buying YES: positive when fair P(YES) > market implied P(YES)
+            # - If buying NO:  positive when fair P(YES) < market implied P(YES)
+            if side == "yes":
+                edge_bps = (p_fair_yes - p_mkt_yes) * 10000.0
+            else:
+                edge_bps = (p_mkt_yes - p_fair_yes) * 10000.0
 
         _log(
             f"select ticker={ticker} side={side.upper()} px={price}c p_mkt_yes={p_mkt_yes:.3f} p_fair_yes={p_fair_yes if p_fair_yes is not None else '—'} edge_bps={edge_bps if edge_bps is not None else '—'} lottery={is_lottery} "
