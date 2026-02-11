@@ -133,9 +133,14 @@ def main():
 
     # External price feed (Coinbase spot)
     price_feed_url = os.getenv("TRADER_PRICE_FEED_URL", "https://api.coinbase.com/v2/prices/BTC-USD/spot")
-    momentum_lookback = int(os.getenv("TRADER_MOMENTUM_LOOKBACK_SECONDS", "180"))
-    momentum_threshold_bps = float(os.getenv("TRADER_MOMENTUM_THRESHOLD_BPS", "8"))  # 8 bps = 0.08%
-    min_minutes_to_close = float(os.getenv("TRADER_MIN_MINUTES_TO_CLOSE", "2"))
+    momentum_lookback = int(os.getenv("TRADER_MOMENTUM_LOOKBACK_SECONDS", "120"))
+    momentum_threshold_bps = float(os.getenv("TRADER_MOMENTUM_THRESHOLD_BPS", "4"))  # 4 bps = 0.04%
+    min_minutes_to_close = float(os.getenv("TRADER_MIN_MINUTES_TO_CLOSE", "1.5"))
+
+    # Microstructure gates + sizing
+    max_spread_cents = int(os.getenv("TRADER_MAX_SPREAD_CENTS", "10"))
+    depth_within_cents = int(os.getenv("TRADER_DEPTH_WITHIN_CENTS", "2"))
+    top_qty_fraction = float(os.getenv("TRADER_TOP_QTY_FRACTION", "0.30"))
 
     # Exits / risk guards
     exits_enabled = os.getenv("TRADER_EXITS_ENABLED", "false").lower() == "true"
@@ -166,6 +171,11 @@ def main():
 
     # Heartbeat logging
     heartbeat_every = int(os.getenv("TRADER_HEARTBEAT_EVERY_LOOPS", "5"))
+
+    # How many proposals to evaluate per loop
+    candidates_to_check = int(os.getenv("TRADER_CANDIDATES_TO_CHECK", "25"))
+    if candidates_to_check <= 0:
+        candidates_to_check = 25
 
     # Optional stop conditions (default disabled)
     max_trades = int(os.getenv("TRADER_MAX_TRADES", "0"))
@@ -447,7 +457,7 @@ def main():
         chosen_close_time = None
 
         # Try multiple proposals until one passes gates
-        for p in props[:10]:
+        for p in props[:candidates_to_check]:
             stats["candidates_checked"] += 1
             ticker = p.get("ticker")
             title = (p.get("title") or "")
@@ -486,6 +496,9 @@ def main():
             implied_yes_ask = 100 - best_no_bid
             implied_no_ask = 100 - best_yes_bid
 
+            spread_yes = implied_yes_ask - best_yes_bid
+            spread_no = implied_no_ask - best_no_bid
+
             # Decide direction using BTC momentum for "up in next 15 mins" markets.
             # - If momentum is positive enough -> buy YES
             # - If momentum is negative enough -> buy NO (i.e., bet NOT up)
@@ -509,6 +522,14 @@ def main():
 
             side = want_side
             price = implied_yes_ask if side == "yes" else implied_no_ask
+
+            # Spread gate (avoid toxic / too wide markets)
+            if max_spread_cents > 0:
+                spr = spread_yes if side == "yes" else spread_no
+                if spr > max_spread_cents:
+                    stats.setdefault("skips_spread", 0)
+                    stats["skips_spread"] += 1
+                    continue
 
             if price > max_entry_price_cents:
                 stats["skips_price"] += 1
@@ -576,6 +597,24 @@ def main():
             break
         # Determine a sensible contract count that cannot exceed the max cost.
         count = max(1, buy_max_cost // max(1, price))
+
+        # Depth-based sizing: don't try to take more than a fraction of top-of-book.
+        # (We re-fetch top_qty on selection; if unavailable just keep count.)
+        try:
+            # We can approximate available top qty from the last proposal loop variables by re-reading the orderbook.
+            ob2 = requests.get(base + f"/api/kalshi/markets/{ticker}/orderbook", params={"depth": 5}, timeout=30).json()
+            book2 = (ob2.get("orderbook") or {})
+            yes2 = book2.get("yes") or []
+            no2 = book2.get("no") or []
+            if yes2 and no2:
+                best_yes_qty2 = int(yes2[0][1])
+                best_no_qty2 = int(no2[0][1])
+                top_qty2 = best_no_qty2 if side == "yes" else best_yes_qty2
+                if top_qty_fraction > 0:
+                    cap = max(1, int(top_qty2 * top_qty_fraction))
+                    count = max(1, min(count, cap))
+        except Exception:
+            pass
 
         payload = {
             "ticker": ticker,
