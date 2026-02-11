@@ -707,7 +707,7 @@ def main():
             is_btc_up_15m = tkr_u.startswith("KXBTC15M") and ("BTC" in title_u and "PRICE" in title_u and "UP" in title_u)
             is_kxbtc_range = tkr_u.startswith("KXBTC-") and ("PRICE RANGE" in title_u)
 
-            if spot_px is None or spot_vol_bps is None:
+            if spot_px is None:
                 stats["skips_direction"] += 1
                 continue
 
@@ -738,8 +738,11 @@ def main():
                 if spot_ret_bps is not None and momentum_lookback > 0:
                     mu = (spot_ret_bps / 10000.0) * (horizon_s / float(momentum_lookback))
 
-                # Vol scaling (treat spot_vol_bps roughly as per-minute)
-                sigma = abs(spot_vol_bps / 10000.0) * math.sqrt(horizon_s / 60.0)
+                # Vol scaling (treat spot_vol_bps roughly as per-minute). If not available yet,
+                # fall back to a conservative default to avoid skipping all early trades.
+                default_vol_bps = float(os.getenv("TRADER_DEFAULT_VOL_BPS", "60"))
+                vol_bps = float(spot_vol_bps) if spot_vol_bps is not None else default_vol_bps
+                sigma = abs(vol_bps / 10000.0) * math.sqrt(horizon_s / 60.0)
                 sigma = max(1e-6, sigma)
 
                 mlog = math.log(float(spot_px)) + mu
