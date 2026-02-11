@@ -155,6 +155,7 @@ def main():
     min_edge_bps = float(os.getenv("TRADER_MIN_EDGE_BPS", "12"))  # require 0.12% edge vs market-implied probability
     min_mkt_prob = float(os.getenv("TRADER_MIN_MKT_PROB", "0.12"))
     max_mkt_prob = float(os.getenv("TRADER_MAX_MKT_PROB", "0.88"))
+    lottery_max_cost_cents = int(os.getenv("TRADER_LOTTERY_MAX_COST_CENTS", "300"))
     fair_k = float(os.getenv("TRADER_FAIR_K", "0.8"))            # maps momentum bps -> prob shift
     fair_vol_window = int(os.getenv("TRADER_FAIR_VOL_WINDOW_SECONDS", "300"))
     fair_max_shift_prob = float(os.getenv("TRADER_FAIR_MAX_SHIFT_PROB", "0.03"))  # cap |p_fair-0.5|
@@ -550,6 +551,7 @@ def main():
         chosen_price = None
         chosen_title = None
         chosen_close_time = None
+        chosen_lottery = False
 
         # Try multiple proposals until one passes gates
         for p in props[:candidates_to_check]:
@@ -615,11 +617,9 @@ def main():
                 p_mkt_yes_if_buy_yes = implied_yes_ask / 100.0
                 p_mkt_yes_if_buy_no = 1.0 - (implied_no_ask / 100.0)
 
-                # Market sanity band: skip extreme prices unless you intentionally want lottery tickets.
-                if (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob):
-                    continue
-                if (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob):
-                    continue
+                # Market sanity band: if extreme, allow only as a small "lottery" sized trade.
+                lot_yes = (p_mkt_yes_if_buy_yes < min_mkt_prob) or (p_mkt_yes_if_buy_yes > max_mkt_prob)
+                lot_no = (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob)
 
                 edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
                 edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0  # positive means NO is underpriced
@@ -632,11 +632,13 @@ def main():
                 if spot_ret_bps > 0:
                     if edge_bps_yes >= min_edge_bps:
                         want_side = "yes"
+                        want_lottery = bool(lot_yes)
                     else:
                         continue
                 else:
                     if edge_bps_no >= min_edge_bps:
                         want_side = "no"
+                        want_lottery = bool(lot_no)
                     else:
                         continue
             else:
@@ -688,6 +690,7 @@ def main():
             chosen_price = max(1, min(99, int(price)))
             chosen_title = title
             chosen_close_time = close_time
+            chosen_lottery = bool(locals().get('want_lottery', False))
             break
 
         if not chosen:
@@ -704,6 +707,7 @@ def main():
         ticker = chosen
         side = chosen_side
         price = chosen_price
+        is_lottery = chosen_lottery
 
         # Market-implied P(YES) for the chosen order
         p_mkt_yes = (price / 100.0) if side == "yes" else (1.0 - (price / 100.0))
@@ -712,7 +716,7 @@ def main():
             edge_bps = (p_fair_yes - p_mkt_yes) * 10000.0
 
         _log(
-            f"select ticker={ticker} side={side.upper()} px={price}c p_mkt_yes={p_mkt_yes:.3f} p_fair_yes={p_fair_yes if p_fair_yes is not None else '—'} edge_bps={edge_bps if edge_bps is not None else '—'} "
+            f"select ticker={ticker} side={side.upper()} px={price}c p_mkt_yes={p_mkt_yes:.3f} p_fair_yes={p_fair_yes if p_fair_yes is not None else '—'} edge_bps={edge_bps if edge_bps is not None else '—'} lottery={is_lottery} "
             f"title={chosen_title!r} close={chosen_close_time} spot={spot_px if spot_px is not None else '—'} ret_bps={spot_ret_bps if spot_ret_bps is not None else '—'} vol_bps={spot_vol_bps if spot_vol_bps is not None else '—'}",
             log_path=log_path,
         )
@@ -724,6 +728,8 @@ def main():
 
         # 3) place FoK order (limit)
         buy_max_cost = min(max_cost_trade, max(0, daily_max_cost - net_spent_today_cents))
+        if is_lottery and lottery_max_cost_cents > 0:
+            buy_max_cost = min(buy_max_cost, lottery_max_cost_cents)
         if target_spend_cents > 0:
             buy_max_cost = min(buy_max_cost, max(0, target_spend_cents - net_spent_today_cents))
         if avail_cents > 0:
