@@ -200,6 +200,8 @@ def main():
     # Optional allowlist for what the autotrader is allowed to touch.
     allow_prefixes = [p.strip() for p in os.getenv("TRADER_TICKER_ALLOW_PREFIXES", "KXBTC,KXBTC15M,KXBTCD,KXETH").split(",") if p.strip()]
 
+    trader_mode = os.getenv("TRADER_MODE", "smart").strip().lower()  # smart|simple
+
     # External price feed (Coinbase spot)
     price_feed_url = os.getenv("TRADER_PRICE_FEED_URL", "https://api.coinbase.com/v2/prices/BTC-USD/spot")
     momentum_lookback = int(os.getenv("TRADER_MOMENTUM_LOOKBACK_SECONDS", "120"))
@@ -402,6 +404,10 @@ def main():
         max_entry_price_cents = base_max_entry_price_cents
         min_top_qty = base_min_top_qty
         tif = "fill_or_kill"
+
+        # SIMPLE mode: always attempt a BTC15M trade each cycle (best-effort), with minimal sizing.
+        # We keep safety rails: allowlist, limit orders, max-loss caps, liquidity gates.
+        simple_force_trade = (trader_mode == "simple")
 
         mins_left = None
         if cutoff:
@@ -888,31 +894,41 @@ def main():
             edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
             edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0
 
-            # For 15m "UP" markets, require direction agreement with momentum.
+            # For 15m "UP" markets:
+            # - SMART mode: require momentum + min edge
+            # - SIMPLE mode: always pick a side based on momentum sign (or default YES), and place a tiny trade
             if is_btc_up_15m:
-                if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
-                    stats["skips_direction"] += 1
+                if simple_force_trade:
+                    # best-effort direction: follow sign, default YES if unknown
                     if spot_ret_bps is None:
-                        _add_reject(rejects, "no_momentum", penalty=momentum_threshold_bps, ticker=ticker, ret_bps=None, thr=momentum_threshold_bps)
-                    else:
-                        _add_reject(rejects, "momentum_too_small", penalty=(momentum_threshold_bps - abs(spot_ret_bps)), ticker=ticker, ret_bps=spot_ret_bps, thr=momentum_threshold_bps)
-                    continue
-                if spot_ret_bps > 0:
-                    if edge_bps_yes >= min_edge_bps:
                         want_side = "yes"
-                        want_lottery = bool(lot_yes)
                     else:
-                        stats["skips_edge"] += 1
-                        _add_reject(rejects, "edge", penalty=(min_edge_bps - edge_bps_yes), ticker=ticker, edge_bps=edge_bps_yes, min_edge_bps=min_edge_bps, side="YES")
-                        continue
+                        want_side = "yes" if spot_ret_bps >= 0 else "no"
+                    want_lottery = False
                 else:
-                    if edge_bps_no >= min_edge_bps:
-                        want_side = "no"
-                        want_lottery = bool(lot_no)
-                    else:
-                        stats["skips_edge"] += 1
-                        _add_reject(rejects, "edge", penalty=(min_edge_bps - edge_bps_no), ticker=ticker, edge_bps=edge_bps_no, min_edge_bps=min_edge_bps, side="NO")
+                    if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
+                        stats["skips_direction"] += 1
+                        if spot_ret_bps is None:
+                            _add_reject(rejects, "no_momentum", penalty=momentum_threshold_bps, ticker=ticker, ret_bps=None, thr=momentum_threshold_bps)
+                        else:
+                            _add_reject(rejects, "momentum_too_small", penalty=(momentum_threshold_bps - abs(spot_ret_bps)), ticker=ticker, ret_bps=spot_ret_bps, thr=momentum_threshold_bps)
                         continue
+                    if spot_ret_bps > 0:
+                        if edge_bps_yes >= min_edge_bps:
+                            want_side = "yes"
+                            want_lottery = bool(lot_yes)
+                        else:
+                            stats["skips_edge"] += 1
+                            _add_reject(rejects, "edge", penalty=(min_edge_bps - edge_bps_yes), ticker=ticker, edge_bps=edge_bps_yes, min_edge_bps=min_edge_bps, side="YES")
+                            continue
+                    else:
+                        if edge_bps_no >= min_edge_bps:
+                            want_side = "no"
+                            want_lottery = bool(lot_no)
+                        else:
+                            stats["skips_edge"] += 1
+                            _add_reject(rejects, "edge", penalty=(min_edge_bps - edge_bps_no), ticker=ticker, edge_bps=edge_bps_no, min_edge_bps=min_edge_bps, side="NO")
+                            continue
             else:
                 # Range markets: pick whichever side has enough edge (no momentum sign requirement)
                 if edge_bps_yes >= min_edge_bps:
@@ -1063,7 +1079,10 @@ def main():
             print("No remaining budget/cash; stopping")
             break
         # Determine a sensible contract count that cannot exceed the max cost.
-        count = max(1, buy_max_cost // max(1, price))
+        if trader_mode == "simple":
+            count = 1
+        else:
+            count = max(1, buy_max_cost // max(1, price))
 
         # Depth-based sizing: don't try to take more than a fraction of top-of-book.
         # (We re-fetch top_qty on selection; if unavailable just keep count.)
