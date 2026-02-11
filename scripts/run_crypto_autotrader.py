@@ -149,6 +149,7 @@ def main():
     # Microstructure gates + sizing
     max_spread_cents = int(os.getenv("TRADER_MAX_SPREAD_CENTS", "10"))
     depth_within_cents = int(os.getenv("TRADER_DEPTH_WITHIN_CENTS", "2"))
+    min_depth_within_qty = int(os.getenv("TRADER_MIN_DEPTH_WITHIN_QTY", "50"))
     top_qty_fraction = float(os.getenv("TRADER_TOP_QTY_FRACTION", "0.30"))
 
     # Edge model (fair prob vs market)
@@ -329,6 +330,14 @@ def main():
         max_entry_price_cents = base_max_entry_price_cents
         min_top_qty = base_min_top_qty
         tif = "fill_or_kill"
+
+        # Entries disabled close to expiry (rotation mode): exits may still run.
+        entries_enabled = True
+        try:
+            if min_minutes_to_close > 0 and mins_left is not None and mins_left < min_minutes_to_close:
+                entries_enabled = False
+        except Exception:
+            pass
 
         mins_left = None
         if cutoff:
@@ -714,7 +723,6 @@ def main():
             # Time-to-close gate (avoid trading the last ~minutes)
             try:
                 if close_time:
-                    # close_time comes like 2026-02-10T19:45:00Z
                     ct = dt.datetime.fromisoformat(str(close_time).replace('Z', '+00:00')).astimezone()
                     mins_to_close = (ct - now).total_seconds() / 60.0
                     if mins_to_close < min_minutes_to_close:
@@ -722,10 +730,34 @@ def main():
             except Exception:
                 pass
 
+            if not entries_enabled:
+                continue
+
             top_qty = best_no_qty if side == "yes" else best_yes_qty
             if top_qty < min_top_qty:
                 stats["skips_qty"] += 1
                 _log(f"skip {ticker}: top-of-book qty too low {top_qty} < {min_top_qty}", log_path=log_path)
+                continue
+
+            # Depth-within-N-cents (on the *resting* side we are crossing)
+            # - Buying YES crosses NO bids (since YES ask = 100 - NO bid)
+            # - Buying NO crosses YES bids
+            depth_qty = 0
+            try:
+                if depth_within_cents > 0:
+                    if side == "yes":
+                        # NO bids near best_no_bid
+                        cutoff_px = best_no_bid - depth_within_cents
+                        depth_qty = sum(int(q) for (px, q) in no if int(px) >= cutoff_px)
+                    else:
+                        cutoff_px = best_yes_bid - depth_within_cents
+                        depth_qty = sum(int(q) for (px, q) in yes if int(px) >= cutoff_px)
+            except Exception:
+                depth_qty = 0
+
+            if min_depth_within_qty > 0 and depth_qty < min_depth_within_qty:
+                stats.setdefault("skips_depth", 0)
+                stats["skips_depth"] += 1
                 continue
 
             chosen = ticker
