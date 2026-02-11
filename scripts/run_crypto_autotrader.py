@@ -771,6 +771,9 @@ def main():
             lot_no = (p_mkt_yes_if_buy_no < min_mkt_prob) or (p_mkt_yes_if_buy_no > max_mkt_prob)
             if lot_yes or lot_no:
                 stats["skips_prob_band"] += 1
+                # HARD GATE: if lottery mode is disabled (cap <= 0), do not trade outside the band.
+                if lottery_max_cost_cents <= 0:
+                    continue
 
             edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
             edge_bps_no = (p_mkt_yes_if_buy_no - p_fair_yes) * 10000.0
