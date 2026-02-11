@@ -239,6 +239,17 @@ def main():
     day_start_avail_cents = None  # set after first successful balance fetch
     net_spent_today_cents = 0
 
+    # Persist day-start balance so the daily cap survives script restarts.
+    day_state_path = os.getenv("TRADER_DAY_STATE_PATH", os.path.join(REPO_DIR, "data", "day_state.json"))
+    try:
+        if os.path.exists(day_state_path):
+            with open(day_state_path, "r", encoding="utf-8") as f:
+                st = json.load(f) or {}
+            if st.get("day") == str(day_key) and st.get("day_start_avail_cents") is not None:
+                day_start_avail_cents = int(st.get("day_start_avail_cents"))
+    except Exception:
+        pass
+
     fills = 0
 
     _log("Kalshi Sentinel AUTOTRADER v0", log_path=log_path)
@@ -276,6 +287,11 @@ def main():
             net_spent_today_cents = 0
             _log(f"new day {day_key.isoformat()}: resetting daily accounting", log_path=log_path)
             _send_telegram(f"Kalshi Sentinel: new day {day_key.isoformat()} (daily limits reset)")
+            try:
+                with open(day_state_path, "w", encoding="utf-8") as f:
+                    json.dump({"day": str(day_key), "day_start_avail_cents": None}, f)
+            except Exception:
+                pass
 
         # Daily realized loss guard (requires sells to matter)
         if daily_loss_limit_cents > 0:
@@ -344,6 +360,12 @@ def main():
         if avail_cents > 0:
             if day_start_avail_cents is None:
                 day_start_avail_cents = avail_cents
+                try:
+                    os.makedirs(os.path.dirname(day_state_path), exist_ok=True)
+                    with open(day_state_path, "w", encoding="utf-8") as f:
+                        json.dump({"day": str(day_key), "day_start_avail_cents": int(day_start_avail_cents)}, f)
+                except Exception:
+                    pass
             net_spent_today_cents = max(0, int(day_start_avail_cents - avail_cents))
 
         # Daily net spend cap check (runs continuously until stopped)
