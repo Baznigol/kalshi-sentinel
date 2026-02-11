@@ -97,6 +97,27 @@ def _log(line: str, *, log_path: str | None = None):
             pass
 
 
+def _add_reject(rejects: list[dict], reason: str, *, penalty: float | None = None, **fields):
+    """Collect non-spammy reject diagnostics.
+
+    We only log these on heartbeat when no candidate passes.
+    `penalty` is "distance from passing"; smaller is closer.
+    """
+    try:
+        if rejects is None:
+            return
+        if len(rejects) >= int(os.getenv("TRADER_REJECT_LOG_MAX", "30")):
+            return
+        rec = {"reason": reason}
+        if penalty is not None:
+            rec["penalty"] = float(penalty)
+        for k, v in fields.items():
+            rec[k] = v
+        rejects.append(rec)
+    except Exception:
+        return
+
+
 def _send_telegram(text: str):
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -638,6 +659,10 @@ def main():
         chosen_close_time = None
         chosen_lottery = False
 
+        # Collect a few "closest rejects" for clean, math-based logging
+        rejects: list[dict] = []
+        reject_topn = int(os.getenv("TRADER_REJECT_LOG_TOPN", "3"))
+
         # Try multiple proposals until one passes gates
         for p in props[:candidates_to_check]:
             stats["candidates_checked"] += 1
@@ -710,18 +735,21 @@ def main():
 
             if spot_px is None:
                 stats["skips_direction"] += 1
+                _add_reject(rejects, "no_spot", penalty=1.0, ticker=ticker)
                 continue
 
             # Compute p_fair_yes depending on market type
             if is_btc_up_15m:
                 if p_fair_yes is None:
                     stats["skips_direction"] += 1
+                    _add_reject(rejects, "no_fair_prob", penalty=1.0, ticker=ticker)
                     continue
             elif is_kxbtc_range:
                 sub = p.get("subtitle") or ""
                 lo, hi = _parse_range_subtitle(sub)
                 if lo is None and hi is None:
                     stats["skips_semantics"] += 1
+                    _add_reject(rejects, "bad_subtitle", penalty=1.0, ticker=ticker, subtitle=sub)
                     continue
 
                 # Near-the-money bucket filter: only trade buckets close to spot.
@@ -735,6 +763,7 @@ def main():
                     rel = abs(anchor - s0) / max(1.0, s0)
                     if range_near_pct > 0 and rel > range_near_pct:
                         stats["skips_near"] += 1
+                        _add_reject(rejects, "not_near_money", penalty=(rel - range_near_pct), ticker=ticker, rel=round(rel, 6), near_pct=range_near_pct)
                         continue
                 except Exception:
                     pass
@@ -776,6 +805,7 @@ def main():
                 p_fair_yes = max(0.001, min(0.999, float(p_fair_yes)))
             else:
                 stats["skips_semantics"] += 1
+                _add_reject(rejects, "unsupported_market", penalty=1.0, ticker=ticker, title=title)
                 continue
 
             # Market-implied P(YES) for buying each side at the implied ask:
@@ -789,6 +819,10 @@ def main():
                 stats["skips_prob_band"] += 1
                 # HARD GATE: if lottery mode is disabled (cap <= 0), do not trade outside the band.
                 if lottery_max_cost_cents <= 0:
+                    # distance to band (0 means inside)
+                    p = p_mkt_yes_if_buy_yes if lot_yes else p_mkt_yes_if_buy_no
+                    dist = (min_mkt_prob - p) if p < min_mkt_prob else (p - max_mkt_prob)
+                    _add_reject(rejects, "prob_band", penalty=float(dist), ticker=ticker, p=float(p), band=[min_mkt_prob, max_mkt_prob])
                     continue
 
             edge_bps_yes = (p_fair_yes - p_mkt_yes_if_buy_yes) * 10000.0
@@ -798,6 +832,7 @@ def main():
             if is_btc_up_15m:
                 if spot_ret_bps is None or abs(spot_ret_bps) < momentum_threshold_bps:
                     stats["skips_direction"] += 1
+                    _add_reject(rejects, "momentum_too_small", penalty=(momentum_threshold_bps - abs(spot_ret_bps)), ticker=ticker, ret_bps=spot_ret_bps, thr=momentum_threshold_bps)
                     continue
                 if spot_ret_bps > 0:
                     if edge_bps_yes >= min_edge_bps:
@@ -805,6 +840,7 @@ def main():
                         want_lottery = bool(lot_yes)
                     else:
                         stats["skips_edge"] += 1
+                        _add_reject(rejects, "edge", penalty=(min_edge_bps - edge_bps_yes), ticker=ticker, edge_bps=edge_bps_yes, min_edge_bps=min_edge_bps, side="YES")
                         continue
                 else:
                     if edge_bps_no >= min_edge_bps:
@@ -812,6 +848,7 @@ def main():
                         want_lottery = bool(lot_no)
                     else:
                         stats["skips_edge"] += 1
+                        _add_reject(rejects, "edge", penalty=(min_edge_bps - edge_bps_no), ticker=ticker, edge_bps=edge_bps_no, min_edge_bps=min_edge_bps, side="NO")
                         continue
             else:
                 # Range markets: pick whichever side has enough edge (no momentum sign requirement)
@@ -823,6 +860,8 @@ def main():
                     want_lottery = bool(lot_no)
                 else:
                     stats["skips_edge"] += 1
+                    best = max(edge_bps_yes, edge_bps_no)
+                    _add_reject(rejects, "edge", penalty=(min_edge_bps - best), ticker=ticker, edge_yes=edge_bps_yes, edge_no=edge_bps_no, min_edge_bps=min_edge_bps)
                     continue
 
             side = want_side
@@ -832,6 +871,7 @@ def main():
             exit_bid = best_yes_bid if side == "yes" else best_no_bid
             if min_exit_bid_cents > 0 and exit_bid < min_exit_bid_cents:
                 stats["skips_no_exit_bid"] += 1
+                _add_reject(rejects, "exit_bid", penalty=(min_exit_bid_cents - exit_bid), ticker=ticker, exit_bid=exit_bid, min_exit_bid=min_exit_bid_cents)
                 continue
 
             # Spread gate (avoid toxic / too wide markets)
@@ -839,6 +879,7 @@ def main():
                 spr = spread_yes if side == "yes" else spread_no
                 if spr > max_spread_cents:
                     stats["skips_spread"] += 1
+                    _add_reject(rejects, "spread", penalty=(spr - max_spread_cents), ticker=ticker, spread=spr, max_spread=max_spread_cents)
                     continue
 
             if price > max_entry_price_cents:
@@ -902,6 +943,19 @@ def main():
                     f"skips_exitbid={stats['skips_no_exit_bid']} skips_spread={stats['skips_spread']} skips_depth={stats['skips_depth']} skips_qty={stats['skips_qty']} skips_price={stats['skips_price']} skips_poscap={stats['skips_poscap']} skips_cooldown={stats['skips_cooldown']}",
                     log_path=log_path,
                 )
+
+                if reject_topn > 0 and rejects:
+                    # log the closest-to-passing rejects (smallest penalty first)
+                    def keyfn(r):
+                        try:
+                            return float(r.get("penalty", 9999.0))
+                        except Exception:
+                            return 9999.0
+
+                    top_rej = sorted(rejects, key=keyfn)[:reject_topn]
+                    for rj in top_rej:
+                        _log(f"reject: {json.dumps(rj, ensure_ascii=False)}", log_path=log_path)
+
             _log("no candidates passed gates; sleeping", log_path=log_path)
             time.sleep(interval)
             continue
