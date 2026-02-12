@@ -654,7 +654,9 @@ def main():
             except Exception as e:
                 _log(f"spot feature calc error: {e}", log_path=log_path)
 
-        # Optional exit logic (edge compression / rotation + TP/SL fallback)
+        # ── EXIT ENGINE v1 ─────────────────────────────────────────────
+        # IOC exit ladder: best_bid → best_bid-1 → best_bid-2
+        # Triggers: forced timer, edge compression, TP, SL
         if exits_enabled:
             try:
                 mtm = requests.get(base + "/api/status/positions_mtm", timeout=30).json()
@@ -665,7 +667,7 @@ def main():
                         continue
                     if allow_prefixes and not any(str(tkr).startswith(px) for px in allow_prefixes):
                         continue
-                    pos_qty = int(r.get("position") or 0)
+                    pos_qty = int(r.get("position") or r.get("qty") or 0)
                     if pos_qty <= 0:
                         continue
                     unreal = int(r.get("unreal_pnl_cents") or 0)
@@ -674,7 +676,7 @@ def main():
                     if side0 not in ("yes", "no"):
                         side0 = "yes"
 
-                    # Edge compression: compute market-implied P(YES) from exit bid on your side.
+                    # Edge compression: compute market-implied P(YES) from exit bid
                     best_bid = int(r.get("best_exit_bid") or 0)
                     if best_bid <= 0:
                         continue
@@ -683,18 +685,18 @@ def main():
                     else:
                         p_mkt_yes = 1.0 - (best_bid / 100.0)
 
-                    # Compute fair prob now (if unavailable, fall back to TP/SL)
                     edge_bps_now = None
                     if p_fair_yes is not None:
                         edge_bps_now = (p_fair_yes - p_mkt_yes) * 10000.0
 
-                    # Rotation / timeout
+                    # Rotation / forced timeout
                     too_old = False
+                    hold_age_s = 0.0
                     try:
                         ts = _last_entry_ts(conn, ticker=tkr, side=side0)
                         if ts:
-                            age = (now - dt.datetime.fromisoformat(ts)).total_seconds()
-                            too_old = (max_hold_seconds > 0 and age >= max_hold_seconds)
+                            hold_age_s = (now - dt.datetime.fromisoformat(ts)).total_seconds()
+                            too_old = (max_hold_seconds > 0 and hold_age_s >= max_hold_seconds)
                     except Exception:
                         too_old = False
 
@@ -705,61 +707,118 @@ def main():
                     if not (hit_edge_compress or too_old or hit_tp or hit_sl):
                         continue
 
-                    # Sell at best bid (or a bit below if exit_max_slip is set)
-                    sell_qty = pos_qty
-
-                    side = side0
-
-                    sell_px = max(1, best_bid - max(0, exit_max_slip))
-
-                    payload = {
-                        "ticker": tkr,
-                        "side": side,
-                        "action": "sell",
-                        "type": "limit",
-                        "count": sell_qty,
-                        "time_in_force": "immediate_or_cancel",
-                    }
-                    if side == "yes":
-                        payload["yes_price"] = sell_px
-                    else:
-                        payload["no_price"] = sell_px
+                    # Determine trigger reason for logging
+                    trigger_reasons = []
+                    if too_old:
+                        trigger_reasons.append(f"FORCED_TIMER({hold_age_s:.0f}s>={max_hold_seconds}s)")
+                    if hit_tp:
+                        trigger_reasons.append(f"TP(unreal={unreal}c>={take_profit_cents}c)")
+                    if hit_sl:
+                        trigger_reasons.append(f"SL(unreal={unreal}c<=-{abs(stop_loss_cents)}c)")
+                    if hit_edge_compress:
+                        trigger_reasons.append(f"EDGE_COMPRESS(|{edge_bps_now:.1f}|<={exit_edge_eps_bps}bps)")
+                    trigger_str = "+".join(trigger_reasons)
 
                     _log(
-                        f"EXIT signal: {tkr} SELL {side.upper()} qty={sell_qty} @ {sell_px}c (best={best_bid} slip={exit_max_slip}) "
-                        f"unreal={unreal}c edge_bps={edge_bps_now if edge_bps_now is not None else '—'} too_old={too_old}",
+                        f"EXIT_CHECK: {tkr} {side0.upper()} qty={pos_qty} trigger={trigger_str} "
+                        f"best_bid={best_bid}c unreal={unreal}c hold={hold_age_s:.0f}s",
                         log_path=log_path,
                     )
-                    resp = requests.post(base + "/api/kalshi/orders", json=payload, timeout=60)
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        _log(f"exit order non-json: {resp.status_code} {(resp.text or '')[:300]}", log_path=log_path)
-                        continue
 
-                    # record if filled
-                    filled_qty = 0
-                    filled_cost = 0
-                    order_id = None
-                    if isinstance(data, dict) and isinstance(data.get("order"), dict):
-                        o = data["order"]
-                        order_id = o.get("order_id")
+                    # ── IOC EXIT LADDER: 3 rungs ──
+                    # Rung 0: best_bid  |  Rung 1: best_bid-1  |  Rung 2: best_bid-2
+                    remaining_qty = pos_qty
+                    total_exit_filled = 0
+                    total_exit_proceeds = 0
+                    ladder_rungs = [best_bid, max(1, best_bid - 1), max(1, best_bid - 2)]
+
+                    for rung_idx, rung_px in enumerate(ladder_rungs):
+                        if remaining_qty <= 0:
+                            break
+
+                        payload = {
+                            "ticker": tkr,
+                            "side": side0,
+                            "action": "sell",
+                            "type": "limit",
+                            "count": remaining_qty,
+                            "time_in_force": "immediate_or_cancel",
+                        }
+                        if side0 == "yes":
+                            payload["yes_price"] = rung_px
+                        else:
+                            payload["no_price"] = rung_px
+
+                        _log(
+                            f"EXIT_LADDER rung={rung_idx} {tkr} SELL {side0.upper()} qty={remaining_qty} @ {rung_px}c",
+                            log_path=log_path,
+                        )
+
                         try:
-                            filled_qty = int(o.get("fill_count", 0) or 0)
-                            # for sells, treat proceeds as cost_cents for ledger purposes
-                            taker = int(o.get("taker_fill_cost", 0) or 0)
-                            maker = int(o.get("maker_fill_cost", 0) or 0)
-                            fees = int(o.get("taker_fees", 0) or 0) + int(o.get("maker_fees", 0) or 0)
-                            filled_cost = taker + maker - fees
-                        except Exception:
+                            resp = requests.post(base + "/api/kalshi/orders", json=payload, timeout=60)
+                            try:
+                                data = resp.json()
+                            except Exception:
+                                _log(f"EXIT_LADDER rung={rung_idx} non-json: {resp.status_code} {(resp.text or '')[:300]}", log_path=log_path)
+                                continue
+
                             filled_qty = 0
                             filled_cost = 0
+                            order_id = None
+                            if isinstance(data, dict) and isinstance(data.get("order"), dict):
+                                o = data["order"]
+                                order_id = o.get("order_id")
+                                try:
+                                    filled_qty = int(o.get("fill_count", 0) or 0)
+                                    taker = int(o.get("taker_fill_cost", 0) or 0)
+                                    maker = int(o.get("maker_fill_cost", 0) or 0)
+                                    fees = int(o.get("taker_fees", 0) or 0) + int(o.get("maker_fees", 0) or 0)
+                                    filled_cost = taker + maker - fees
+                                except Exception:
+                                    filled_qty = 0
+                                    filled_cost = 0
 
-                    if filled_qty > 0:
-                        _record_trade(conn, ticker=tkr, side=side, action="sell", price_cents=sell_px, qty=filled_qty, cost_cents=filled_cost, order_id=order_id, raw=data)
-                        _send_telegram(f"Kalshi Sentinel EXIT: SOLD {tkr} {side.upper()} qty={filled_qty} @ {sell_px}c")
+                            if filled_qty > 0:
+                                _record_trade(
+                                    conn, ticker=tkr, side=side0, action="sell",
+                                    price_cents=rung_px, qty=filled_qty,
+                                    cost_cents=filled_cost, order_id=order_id, raw=data,
+                                )
+                                remaining_qty -= filled_qty
+                                total_exit_filled += filled_qty
+                                total_exit_proceeds += filled_cost
+                                _log(
+                                    f"EXIT_LADDER rung={rung_idx} FILLED qty={filled_qty} @ {rung_px}c proceeds={filled_cost}c remaining={remaining_qty}",
+                                    log_path=log_path,
+                                )
+                            else:
+                                _log(
+                                    f"EXIT_LADDER rung={rung_idx} NO_FILL @ {rung_px}c remaining={remaining_qty}",
+                                    log_path=log_path,
+                                )
+                        except Exception as e:
+                            _log(f"EXIT_LADDER rung={rung_idx} error: {e}", log_path=log_path)
+
+                    # ── Exit summary ──
+                    if total_exit_filled > 0:
+                        avg_exit_px = total_exit_proceeds / total_exit_filled if total_exit_filled else 0
+                        _log(
+                            f"EXIT_COMPLETE: {tkr} {side0.upper()} sold={total_exit_filled}/{pos_qty} "
+                            f"avg_px={avg_exit_px:.1f}c proceeds={total_exit_proceeds}c trigger={trigger_str} "
+                            f"unfilled={remaining_qty}",
+                            log_path=log_path,
+                        )
+                        _send_telegram(
+                            f"Kalshi EXIT: {tkr} {side0.upper()} sold={total_exit_filled}/{pos_qty} "
+                            f"@ avg {avg_exit_px:.1f}c ({trigger_str})"
+                        )
+                    else:
+                        _log(
+                            f"EXIT_FAILED: {tkr} {side0.upper()} all 3 rungs missed (best_bid={best_bid}c) trigger={trigger_str}",
+                            log_path=log_path,
+                        )
             except Exception as e:
-                _log(f"exit loop error: {e}", log_path=log_path)
+                _log(f"exit engine error: {e}", log_path=log_path)
 
         # 1) get paper proposals (crypto discovery + scoring)
         try:

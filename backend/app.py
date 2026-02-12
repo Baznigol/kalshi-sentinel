@@ -11,7 +11,7 @@ from db import init_db, db_health, get_db
 from audit import log as audit_log
 from strategy import choose_universe
 from status import positions_mtm
-from report import ledger_summary
+from report import ledger_summary, round_trips
 from performance import kalshi_performance
 import json
 
@@ -157,6 +157,17 @@ def report_ledger():
     except Exception as e:
         audit_log("ERROR", "report", "ledger_failed", {"error": str(e)})
         return jsonify({"error": "ledger_failed", "details": str(e)[:500]}), 500
+
+
+@app.route("/api/report/round_trips")
+def report_round_trips():
+    try:
+        days = int(request.args.get("days", "30"))
+        limit = int(request.args.get("limit", "200"))
+        return jsonify(round_trips(days=days, limit=limit))
+    except Exception as e:
+        audit_log("ERROR", "report", "round_trips_failed", {"error": str(e)})
+        return jsonify({"error": "round_trips_failed", "details": str(e)[:500]}), 500
 
 
 @app.route("/api/report/kalshi_performance")
